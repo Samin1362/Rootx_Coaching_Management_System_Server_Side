@@ -43,6 +43,7 @@ let studentsCollection;
 let admissionsCollection;
 let batchesCollection;
 let feesCollection;
+let attendencesCollection;
 let isConnected = false;
 
 async function connectDB() {
@@ -58,6 +59,7 @@ async function connectDB() {
     admissionsCollection = db.collection("admissions");
     batchesCollection = db.collection("batches");
     feesCollection = db.collection("fees");
+    attendencesCollection = db.collection("attendence");
     isConnected = true;
     console.log("✅ Connected to MongoDB");
   } catch (err) {
@@ -212,7 +214,131 @@ app.post("/students", ensureDBConnection, async (req, res) => {
   }
 });
 
-app.patch("/students/:id", ensureDBConnection, async (req, res) => {});
+app.patch("/students/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate ObjectId
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid student ID",
+      });
+    }
+
+    const {
+      name,
+      image,
+      gender,
+      dob,
+      phone,
+      email,
+      address,
+      guardianName,
+      guardianPhone,
+      previousInstitute,
+      batchId,
+      status,
+      admissionDate,
+      documents,
+    } = req.body;
+
+    const updateDoc = {
+      $set: {},
+    };
+
+    // Basic info
+    if (name) updateDoc.$set.name = name;
+    if (image !== undefined) updateDoc.$set.image = image;
+    if (gender !== undefined) updateDoc.$set.gender = gender;
+    if (dob) updateDoc.$set.dob = dob;
+    if (phone) updateDoc.$set.phone = phone;
+    if (email !== undefined) updateDoc.$set.email = email;
+    if (address !== undefined) updateDoc.$set.address = address;
+
+    // Guardian info
+    if (guardianName !== undefined) updateDoc.$set.guardianName = guardianName;
+    if (guardianPhone !== undefined)
+      updateDoc.$set.guardianPhone = guardianPhone;
+
+    // Academic info
+    if (previousInstitute !== undefined)
+      updateDoc.$set.previousInstitute = previousInstitute;
+    if (batchId) updateDoc.$set.batchId = batchId;
+
+    // Status & documents
+    if (status) updateDoc.$set.status = status;
+    if (Array.isArray(documents)) updateDoc.$set.documents = documents;
+
+    // Admission date
+    if (admissionDate) updateDoc.$set.admissionDate = new Date(admissionDate);
+
+    // If no fields provided
+    if (Object.keys(updateDoc.$set).length === 0) {
+      return res.status(400).send({
+        message: "No valid fields provided for update",
+      });
+    }
+
+    const result = await studentsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        message: "Student not found",
+      });
+    }
+
+    res.send({
+      message: "Student updated successfully",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to update student",
+    });
+  }
+});
+
+app.delete("/students/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate ObjectId
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        message: "Invalid student ID",
+      });
+    }
+
+    // Check if student exists
+    const student = await studentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!student) {
+      return res.status(404).send({
+        message: "Student not found",
+      });
+    }
+
+    // Delete student
+    const result = await studentsCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      message: "Student deleted successfully",
+      deletedId: id,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to delete student",
+    });
+  }
+});
 
 // admissions api's
 app.get("/admissions", ensureDBConnection, async (req, res) => {
@@ -632,6 +758,120 @@ app.patch("/fees/:id", ensureDBConnection, async (req, res) => {
     console.error(error);
     res.status(500).send({
       message: "Failed to add payment",
+    });
+  }
+});
+
+// attendence api's
+app.get("/attendences", ensureDBConnection, async (req, res) => {
+  try {
+    const { batchId, date, takenBy, page = 1, limit = 10 } = req.query;
+
+    const query = {};
+
+    // Filter by batch
+    if (batchId) {
+      query.batchId = batchId;
+    }
+
+    // Filter by date (single day)
+    if (date) {
+      const selectedDate = new Date(date);
+      selectedDate.setHours(0, 0, 0, 0);
+
+      const nextDay = new Date(selectedDate);
+      nextDay.setDate(nextDay.getDate() + 1);
+
+      query.date = {
+        $gte: selectedDate,
+        $lt: nextDay,
+      };
+    }
+
+    // Filter by attendance taker
+    if (takenBy) {
+      query.takenBy = takenBy;
+    }
+
+    const attendences = await attendencesCollection
+      .find(query)
+      .sort({ date: -1 }) // latest attendance first
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit))
+      .toArray();
+
+    res.send(attendences);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to fetch attendance records",
+    });
+  }
+});
+
+app.post("/attendences", ensureDBConnection, async (req, res) => {
+  try {
+    const {
+      date,
+      batchId,
+      records, // [{ studentId, status }]
+      takenBy,
+    } = req.body;
+
+    // ---------- Basic validation ----------
+    if (!date || !batchId || !Array.isArray(records) || records.length === 0) {
+      return res.status(400).send({
+        message: "Required fields are missing",
+      });
+    }
+
+    // Validate each attendance record
+    for (const record of records) {
+      if (
+        !record.studentId ||
+        !record.status ||
+        !["present", "absent"].includes(record.status)
+      ) {
+        return res.status(400).send({
+          message: "Invalid attendance record format",
+        });
+      }
+    }
+
+    // ---------- Prevent duplicate attendance (same date + batch) ----------
+    const existingAttendance = await attendencesCollection.findOne({
+      date: new Date(date),
+      batchId,
+    });
+
+    if (existingAttendance) {
+      return res.status(409).send({
+        message: "Attendance already taken for this batch on this date",
+      });
+    }
+
+    // ---------- Create attendance document ----------
+    const attendanceDoc = {
+      date: new Date(date),
+      batchId,
+      records: records.map((r) => ({
+        studentId: r.studentId,
+        status: r.status, // present | absent
+      })),
+      takenBy: takenBy || "admin", // replace later with logged-in user
+      createdAt: new Date(),
+    };
+
+    const result = await attendencesCollection.insertOne(attendanceDoc);
+
+    res.send({
+      message: "Attendance recorded successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to record attendance",
     });
   }
 });
