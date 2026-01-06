@@ -44,6 +44,9 @@ let admissionsCollection;
 let batchesCollection;
 let feesCollection;
 let attendencesCollection;
+let examsCollection;
+let resultsCollection;
+
 let isConnected = false;
 
 async function connectDB() {
@@ -60,6 +63,8 @@ async function connectDB() {
     batchesCollection = db.collection("batches");
     feesCollection = db.collection("fees");
     attendencesCollection = db.collection("attendence");
+    examsCollection = db.collection("exams");
+    resultsCollection = db.collection("results");
     isConnected = true;
     console.log("✅ Connected to MongoDB");
   } catch (err) {
@@ -872,6 +877,196 @@ app.post("/attendences", ensureDBConnection, async (req, res) => {
     console.error(error);
     res.status(500).send({
       message: "Failed to record attendance",
+    });
+  }
+});
+
+// performance api's
+app.get("/exams", ensureDBConnection, async (req, res) => {
+  try {
+    const { batchId, name, page = 1, limit = 10 } = req.query;
+
+    const query = {};
+
+    if (batchId) {
+      query.batchId = batchId;
+    }
+
+    if (name) {
+      query.name = { $regex: name, $options: "i" };
+    }
+
+    const exams = await examsCollection
+      .find(query)
+      .sort({ date: -1 })
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit))
+      .toArray();
+
+    res.send(exams);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to fetch exams",
+    });
+  }
+});
+
+app.post("/exams", ensureDBConnection, async (req, res) => {
+  try {
+    const { name, batchId, totalMarks, date } = req.body;
+
+    // ---------- Validation ----------
+    if (!name || !batchId || !totalMarks || !date) {
+      return res.status(400).send({
+        message: "Required fields are missing",
+      });
+    }
+
+    const exam = {
+      name,
+      batchId,
+      totalMarks: Number(totalMarks),
+      date: new Date(date),
+      createdAt: new Date(),
+    };
+
+    const result = await examsCollection.insertOne(exam);
+
+    res.status(201).send({
+      message: "Exam created successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to create exam",
+    });
+  }
+});
+
+app.delete("/exams", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.query;
+
+    // ---------- Validation ----------
+    if (!id) {
+      return res.status(400).send({
+        message: "Exam ID is required",
+      });
+    }
+
+    // ---------- Check if exam exists ----------
+    const exam = await examsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!exam) {
+      return res.status(404).send({
+        message: "Exam not found",
+      });
+    }
+
+    // ---------- Optional: prevent deletion if results exist ----------
+    const relatedResults = await resultsCollection.findOne({
+      examId: id,
+    });
+
+    if (relatedResults) {
+      return res.status(409).send({
+        message:
+          "Cannot delete exam because results already exist for this exam",
+      });
+    }
+
+    // ---------- Delete exam ----------
+    const result = await examsCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      message: "Exam deleted successfully",
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to delete exam",
+    });
+  }
+});
+
+app.get("/results", ensureDBConnection, async (req, res) => {
+  try {
+    const { examId, studentId, page = 1, limit = 10 } = req.query;
+
+    const query = {};
+
+    if (examId) {
+      query.examId = examId;
+    }
+
+    if (studentId) {
+      query.studentId = studentId;
+    }
+
+    const results = await resultsCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit))
+      .toArray();
+
+    res.send(results);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to fetch results",
+    });
+  }
+});
+
+app.post("/results", ensureDBConnection, async (req, res) => {
+  try {
+    const { examId, studentId, marks, grade } = req.body;
+
+    // ---------- Validation ----------
+    if (!examId || !studentId || marks === undefined) {
+      return res.status(400).send({
+        message: "Required fields are missing",
+      });
+    }
+
+    // ---------- Prevent duplicate result ----------
+    const existingResult = await resultsCollection.findOne({
+      examId,
+      studentId,
+    });
+
+    if (existingResult) {
+      return res.status(409).send({
+        message: "Result already exists for this student in this exam",
+      });
+    }
+
+    const resultDoc = {
+      examId,
+      studentId,
+      marks: Number(marks),
+      grade: grade || "",
+      createdAt: new Date(),
+    };
+
+    const result = await resultsCollection.insertOne(resultDoc);
+
+    res.status(201).send({
+      message: "Result added successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to add result",
     });
   }
 });
