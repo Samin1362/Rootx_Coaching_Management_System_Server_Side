@@ -434,6 +434,7 @@ app.patch("/admissions/:id", ensureDBConnection, async (req, res) => {
       status,
       followUpNote,
       followUpDate,
+      followUps,
     } = req.body;
 
     const updateDoc = {
@@ -452,8 +453,15 @@ app.patch("/admissions/:id", ensureDBConnection, async (req, res) => {
       // inquiry | follow-up | enrolled | rejected
     }
 
-    // Add follow-up entry
-    if (followUpNote) {
+    // Handle follow-ups: either replace array (delete) OR add new entry (add)
+    // Cannot do both $set and $push on same field simultaneously
+    if (followUps !== undefined) {
+      // Replace entire followUps array (used when deleting a follow-up)
+      console.log("Replacing followUps array with:", followUps);
+      updateDoc.$set.followUps = followUps;
+    } else if (followUpNote) {
+      // Add follow-up entry (for add operation)
+      console.log("Adding new follow-up:", followUpNote);
       updateDoc.$push = {
         followUps: {
           note: followUpNote,
@@ -485,11 +493,12 @@ app.patch("/admissions/:id", ensureDBConnection, async (req, res) => {
 
     res.send({
       message: "Admission updated successfully",
+      modifiedCount: result.modifiedCount,
     });
   } catch (error) {
-    console.error(error);
     res.status(500).send({
       message: "Failed to update admission",
+      error: error.message,
     });
   }
 });
@@ -763,6 +772,45 @@ app.patch("/fees/:id", ensureDBConnection, async (req, res) => {
     console.error(error);
     res.status(500).send({
       message: "Failed to add payment",
+    });
+  }
+});
+
+app.delete("/fees/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // ---------- Validation ----------
+    if (!id) {
+      return res.status(400).send({
+        message: "Fee ID is required",
+      });
+    }
+
+    // ---------- Check if fee record exists ----------
+    const fee = await feesCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!fee) {
+      return res.status(404).send({
+        message: "Fee record not found",
+      });
+    }
+
+    // ---------- Delete fee record ----------
+    const result = await feesCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      message: "Fee record deleted successfully",
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to delete fee record",
     });
   }
 });
@@ -1067,6 +1115,45 @@ app.post("/results", ensureDBConnection, async (req, res) => {
     console.error(error);
     res.status(500).send({
       message: "Failed to add result",
+    });
+  }
+});
+
+app.delete("/results/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // ---------- Validation ----------
+    if (!id) {
+      return res.status(400).send({
+        message: "Result ID is required",
+      });
+    }
+
+    // ---------- Check if result exists ----------
+    const resultDoc = await resultsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!resultDoc) {
+      return res.status(404).send({
+        message: "Result not found",
+      });
+    }
+
+    // ---------- Delete result ----------
+    const result = await resultsCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      message: "Result deleted successfully",
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to delete result",
     });
   }
 });
