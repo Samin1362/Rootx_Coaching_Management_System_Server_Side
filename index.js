@@ -46,6 +46,7 @@ let feesCollection;
 let attendencesCollection;
 let examsCollection;
 let resultsCollection;
+let expensesCollection;
 
 let isConnected = false;
 
@@ -65,6 +66,7 @@ async function connectDB() {
     attendencesCollection = db.collection("attendence");
     examsCollection = db.collection("exams");
     resultsCollection = db.collection("results");
+    expensesCollection = db.collection("expenses");
     isConnected = true;
     console.log("✅ Connected to MongoDB");
   } catch (err) {
@@ -1194,6 +1196,326 @@ app.delete("/results/:id", ensureDBConnection, async (req, res) => {
     console.error(error);
     res.status(500).send({
       message: "Failed to delete result",
+    });
+  }
+});
+
+// ==================== EXPENSE MANAGEMENT ROUTES ====================
+
+// CREATE - Add new expense
+app.post("/expenses", ensureDBConnection, async (req, res) => {
+  try {
+    const expense = req.body;
+
+    // Validate required fields
+    if (!expense.category || !expense.amount || !expense.date) {
+      return res.status(400).json({
+        success: false,
+        message: "Category, amount, and date are required",
+      });
+    }
+
+    // Create expense document with proper structure
+    const newExpense = {
+      category: expense.category, // e.g., "Salary", "Utilities", "Supplies", "Maintenance", "Marketing", "Other"
+      amount: parseFloat(expense.amount),
+      date: new Date(expense.date),
+      description: expense.description || "",
+      paymentMethod: expense.paymentMethod || "cash", // cash, bank, card, online
+      paidTo: expense.paidTo || "", // Person/Company name
+      receiptNumber: expense.receiptNumber || "",
+      notes: expense.notes || "",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await expensesCollection.insertOne(newExpense);
+
+    res.status(201).json({
+      success: true,
+      message: "Expense added successfully",
+      expenseId: result.insertedId,
+    });
+  } catch (error) {
+    console.error("Error adding expense:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to add expense",
+      error: error.message,
+    });
+  }
+});
+
+// READ - Get all expenses with optional filters
+app.get("/expenses", ensureDBConnection, async (req, res) => {
+  try {
+    const { category, startDate, endDate, paymentMethod } = req.query;
+    const filter = {};
+
+    // Filter by category
+    if (category) {
+      filter.category = category;
+    }
+
+    // Filter by payment method
+    if (paymentMethod) {
+      filter.paymentMethod = paymentMethod;
+    }
+
+    // Filter by date range
+    if (startDate || endDate) {
+      filter.date = {};
+      if (startDate) {
+        filter.date.$gte = new Date(startDate);
+      }
+      if (endDate) {
+        filter.date.$lte = new Date(endDate);
+      }
+    }
+
+    const expenses = await expensesCollection
+      .find(filter)
+      .sort({ date: -1 })
+      .toArray();
+
+    res.json({
+      success: true,
+      count: expenses.length,
+      data: expenses,
+    });
+  } catch (error) {
+    console.error("Error fetching expenses:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch expenses",
+      error: error.message,
+    });
+  }
+});
+
+// READ - Get single expense by ID
+app.get("/expenses/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense ID",
+      });
+    }
+
+    const expense = await expensesCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!expense) {
+      return res.status(404).json({
+        success: false,
+        message: "Expense not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      data: expense,
+    });
+  } catch (error) {
+    console.error("Error fetching expense:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch expense",
+      error: error.message,
+    });
+  }
+});
+
+// UPDATE - Update expense by ID
+app.patch("/expenses/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense ID",
+      });
+    }
+
+    // Prepare update document
+    const updateDoc = {
+      $set: {
+        ...updates,
+        updatedAt: new Date(),
+      },
+    };
+
+    // Convert amount to number if provided
+    if (updates.amount) {
+      updateDoc.$set.amount = parseFloat(updates.amount);
+    }
+
+    // Convert date to Date object if provided
+    if (updates.date) {
+      updateDoc.$set.date = new Date(updates.date);
+    }
+
+    const result = await expensesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Expense not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Expense updated successfully",
+    });
+  } catch (error) {
+    console.error("Error updating expense:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update expense",
+      error: error.message,
+    });
+  }
+});
+
+// DELETE - Delete expense by ID
+app.delete("/expenses/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense ID",
+      });
+    }
+
+    const result = await expensesCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Expense not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Expense deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error deleting expense:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete expense",
+      error: error.message,
+    });
+  }
+});
+
+// ANALYTICS - Get expense statistics
+app.get("/expenses/analytics/summary", ensureDBConnection, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const matchFilter = {};
+
+    // Filter by date range if provided
+    if (startDate || endDate) {
+      matchFilter.date = {};
+      if (startDate) {
+        matchFilter.date.$gte = new Date(startDate);
+      }
+      if (endDate) {
+        matchFilter.date.$lte = new Date(endDate);
+      }
+    }
+
+    // Aggregate expenses by category
+    const categoryStats = await expensesCollection
+      .aggregate([
+        { $match: matchFilter },
+        {
+          $group: {
+            _id: "$category",
+            totalAmount: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { totalAmount: -1 } },
+      ])
+      .toArray();
+
+    // Get total expenses
+    const totalExpenses = await expensesCollection
+      .aggregate([
+        { $match: matchFilter },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+      ])
+      .toArray();
+
+    // Get expenses by payment method
+    const paymentMethodStats = await expensesCollection
+      .aggregate([
+        { $match: matchFilter },
+        {
+          $group: {
+            _id: "$paymentMethod",
+            totalAmount: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+      ])
+      .toArray();
+
+    res.json({
+      success: true,
+      data: {
+        totalExpenses: totalExpenses[0]?.total || 0,
+        totalCount: totalExpenses[0]?.count || 0,
+        byCategory: categoryStats,
+        byPaymentMethod: paymentMethodStats,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching expense analytics:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch expense analytics",
+      error: error.message,
+    });
+  }
+});
+
+// Get distinct expense categories
+app.get("/expenses/categories/list", ensureDBConnection, async (req, res) => {
+  try {
+    const categories = await expensesCollection.distinct("category");
+
+    res.json({
+      success: true,
+      data: categories,
+    });
+  } catch (error) {
+    console.error("Error fetching categories:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch categories",
+      error: error.message,
     });
   }
 });
