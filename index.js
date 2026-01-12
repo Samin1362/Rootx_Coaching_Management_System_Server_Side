@@ -181,8 +181,22 @@ app.post("/students", ensureDBConnection, async (req, res) => {
       return res.status(400).send({ message: "Required fields missing" });
     }
 
+    // Auto-generate roll number for the batch
+    // Find the highest roll number in this batch and increment by 1
+    const studentsInBatch = await studentsCollection
+      .find({ batchId })
+      .sort({ roll: -1 })
+      .limit(1)
+      .toArray();
+
+    const nextRoll =
+      studentsInBatch.length > 0 && studentsInBatch[0].roll
+        ? studentsInBatch[0].roll + 1
+        : 1;
+
     const newStudent = {
       studentId: `STD-${Date.now()}`, // simple unique ID
+      roll: nextRoll, // Auto-generated roll number per batch
       name,
       image: image || "",
       gender: gender || "",
@@ -212,6 +226,7 @@ app.post("/students", ensureDBConnection, async (req, res) => {
     res.status(201).send({
       message: "Student added successfully",
       insertedId: result.insertedId,
+      roll: nextRoll, // Return the generated roll number
     });
   } catch (error) {
     console.error(error);
@@ -268,7 +283,32 @@ app.patch("/students/:id", ensureDBConnection, async (req, res) => {
     // Academic info
     if (previousInstitute !== undefined)
       updateDoc.$set.previousInstitute = previousInstitute;
-    if (batchId) updateDoc.$set.batchId = batchId;
+
+    // If batch is being changed, regenerate roll number for new batch
+    if (batchId) {
+      // Get current student to check if batch is actually changing
+      const currentStudent = await studentsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (currentStudent && currentStudent.batchId !== batchId) {
+        // Batch is changing, generate new roll number for the new batch
+        const studentsInNewBatch = await studentsCollection
+          .find({ batchId })
+          .sort({ roll: -1 })
+          .limit(1)
+          .toArray();
+
+        const nextRoll =
+          studentsInNewBatch.length > 0 && studentsInNewBatch[0].roll
+            ? studentsInNewBatch[0].roll + 1
+            : 1;
+
+        updateDoc.$set.roll = nextRoll;
+      }
+
+      updateDoc.$set.batchId = batchId;
+    }
 
     // Status & documents
     if (status) updateDoc.$set.status = status;
