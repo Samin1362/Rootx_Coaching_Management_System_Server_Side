@@ -44,6 +44,10 @@ let admissionsCollection;
 let batchesCollection;
 let feesCollection;
 let attendencesCollection;
+let examsCollection;
+let resultsCollection;
+let expensesCollection;
+
 let isConnected = false;
 
 async function connectDB() {
@@ -60,6 +64,9 @@ async function connectDB() {
     batchesCollection = db.collection("batches");
     feesCollection = db.collection("fees");
     attendencesCollection = db.collection("attendence");
+    examsCollection = db.collection("exams");
+    resultsCollection = db.collection("results");
+    expensesCollection = db.collection("expenses");
     isConnected = true;
     console.log("✅ Connected to MongoDB");
   } catch (err) {
@@ -176,8 +183,22 @@ app.post("/students", ensureDBConnection, async (req, res) => {
       return res.status(400).send({ message: "Required fields missing" });
     }
 
+    // Auto-generate roll number for the batch
+    // Find the highest roll number in this batch and increment by 1
+    const studentsInBatch = await studentsCollection
+      .find({ batchId })
+      .sort({ roll: -1 })
+      .limit(1)
+      .toArray();
+
+    const nextRoll =
+      studentsInBatch.length > 0 && studentsInBatch[0].roll
+        ? studentsInBatch[0].roll + 1
+        : 1;
+
     const newStudent = {
       studentId: `STD-${Date.now()}`, // simple unique ID
+      roll: nextRoll, // Auto-generated roll number per batch
       name,
       image: image || "",
       gender: gender || "",
@@ -207,6 +228,7 @@ app.post("/students", ensureDBConnection, async (req, res) => {
     res.status(201).send({
       message: "Student added successfully",
       insertedId: result.insertedId,
+      roll: nextRoll, // Return the generated roll number
     });
   } catch (error) {
     console.error(error);
@@ -263,7 +285,32 @@ app.patch("/students/:id", ensureDBConnection, async (req, res) => {
     // Academic info
     if (previousInstitute !== undefined)
       updateDoc.$set.previousInstitute = previousInstitute;
-    if (batchId) updateDoc.$set.batchId = batchId;
+
+    // If batch is being changed, regenerate roll number for new batch
+    if (batchId) {
+      // Get current student to check if batch is actually changing
+      const currentStudent = await studentsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (currentStudent && currentStudent.batchId !== batchId) {
+        // Batch is changing, generate new roll number for the new batch
+        const studentsInNewBatch = await studentsCollection
+          .find({ batchId })
+          .sort({ roll: -1 })
+          .limit(1)
+          .toArray();
+
+        const nextRoll =
+          studentsInNewBatch.length > 0 && studentsInNewBatch[0].roll
+            ? studentsInNewBatch[0].roll + 1
+            : 1;
+
+        updateDoc.$set.roll = nextRoll;
+      }
+
+      updateDoc.$set.batchId = batchId;
+    }
 
     // Status & documents
     if (status) updateDoc.$set.status = status;
@@ -429,6 +476,7 @@ app.patch("/admissions/:id", ensureDBConnection, async (req, res) => {
       status,
       followUpNote,
       followUpDate,
+      followUps,
     } = req.body;
 
     const updateDoc = {
@@ -447,8 +495,15 @@ app.patch("/admissions/:id", ensureDBConnection, async (req, res) => {
       // inquiry | follow-up | enrolled | rejected
     }
 
-    // Add follow-up entry
-    if (followUpNote) {
+    // Handle follow-ups: either replace array (delete) OR add new entry (add)
+    // Cannot do both $set and $push on same field simultaneously
+    if (followUps !== undefined) {
+      // Replace entire followUps array (used when deleting a follow-up)
+      console.log("Replacing followUps array with:", followUps);
+      updateDoc.$set.followUps = followUps;
+    } else if (followUpNote) {
+      // Add follow-up entry (for add operation)
+      console.log("Adding new follow-up:", followUpNote);
       updateDoc.$push = {
         followUps: {
           note: followUpNote,
@@ -480,11 +535,12 @@ app.patch("/admissions/:id", ensureDBConnection, async (req, res) => {
 
     res.send({
       message: "Admission updated successfully",
+      modifiedCount: result.modifiedCount,
     });
   } catch (error) {
-    console.error(error);
     res.status(500).send({
       message: "Failed to update admission",
+      error: error.message,
     });
   }
 });
@@ -762,6 +818,45 @@ app.patch("/fees/:id", ensureDBConnection, async (req, res) => {
   }
 });
 
+app.delete("/fees/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // ---------- Validation ----------
+    if (!id) {
+      return res.status(400).send({
+        message: "Fee ID is required",
+      });
+    }
+
+    // ---------- Check if fee record exists ----------
+    const fee = await feesCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!fee) {
+      return res.status(404).send({
+        message: "Fee record not found",
+      });
+    }
+
+    // ---------- Delete fee record ----------
+    const result = await feesCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      message: "Fee record deleted successfully",
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to delete fee record",
+    });
+  }
+});
+
 // attendence api's
 app.get("/attendences", ensureDBConnection, async (req, res) => {
   try {
@@ -872,6 +967,555 @@ app.post("/attendences", ensureDBConnection, async (req, res) => {
     console.error(error);
     res.status(500).send({
       message: "Failed to record attendance",
+    });
+  }
+});
+
+// performance api's
+app.get("/exams", ensureDBConnection, async (req, res) => {
+  try {
+    const { batchId, name, page = 1, limit = 10 } = req.query;
+
+    const query = {};
+
+    if (batchId) {
+      query.batchId = batchId;
+    }
+
+    if (name) {
+      query.name = { $regex: name, $options: "i" };
+    }
+
+    const exams = await examsCollection
+      .find(query)
+      .sort({ date: -1 })
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit))
+      .toArray();
+
+    res.send(exams);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to fetch exams",
+    });
+  }
+});
+
+app.post("/exams", ensureDBConnection, async (req, res) => {
+  try {
+    const { name, batchId, totalMarks, date } = req.body;
+
+    // ---------- Validation ----------
+    if (!name || !batchId || !totalMarks || !date) {
+      return res.status(400).send({
+        message: "Required fields are missing",
+      });
+    }
+
+    const exam = {
+      name,
+      batchId,
+      totalMarks: Number(totalMarks),
+      date: new Date(date),
+      createdAt: new Date(),
+    };
+
+    const result = await examsCollection.insertOne(exam);
+
+    res.status(201).send({
+      message: "Exam created successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to create exam",
+    });
+  }
+});
+
+app.delete("/exams", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.query;
+
+    // ---------- Validation ----------
+    if (!id) {
+      return res.status(400).send({
+        message: "Exam ID is required",
+      });
+    }
+
+    // ---------- Check if exam exists ----------
+    const exam = await examsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!exam) {
+      return res.status(404).send({
+        message: "Exam not found",
+      });
+    }
+
+    // ---------- Optional: prevent deletion if results exist ----------
+    const relatedResults = await resultsCollection.findOne({
+      examId: id,
+    });
+
+    if (relatedResults) {
+      return res.status(409).send({
+        message:
+          "Cannot delete exam because results already exist for this exam",
+      });
+    }
+
+    // ---------- Delete exam ----------
+    const result = await examsCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      message: "Exam deleted successfully",
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to delete exam",
+    });
+  }
+});
+
+app.get("/results", ensureDBConnection, async (req, res) => {
+  try {
+    const { examId, studentId, page = 1, limit = 10 } = req.query;
+
+    const query = {};
+
+    if (examId) {
+      query.examId = examId;
+    }
+
+    if (studentId) {
+      query.studentId = studentId;
+    }
+
+    const results = await resultsCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit))
+      .toArray();
+
+    res.send(results);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to fetch results",
+    });
+  }
+});
+
+app.post("/results", ensureDBConnection, async (req, res) => {
+  try {
+    const { examId, studentId, marks, grade } = req.body;
+
+    // ---------- Validation ----------
+    if (!examId || !studentId || marks === undefined) {
+      return res.status(400).send({
+        message: "Required fields are missing",
+      });
+    }
+
+    // ---------- Prevent duplicate result ----------
+    const existingResult = await resultsCollection.findOne({
+      examId,
+      studentId,
+    });
+
+    if (existingResult) {
+      return res.status(409).send({
+        message: "Result already exists for this student in this exam",
+      });
+    }
+
+    const resultDoc = {
+      examId,
+      studentId,
+      marks: Number(marks),
+      grade: grade || "",
+      createdAt: new Date(),
+    };
+
+    const result = await resultsCollection.insertOne(resultDoc);
+
+    res.status(201).send({
+      message: "Result added successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to add result",
+    });
+  }
+});
+
+app.delete("/results/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // ---------- Validation ----------
+    if (!id) {
+      return res.status(400).send({
+        message: "Result ID is required",
+      });
+    }
+
+    // ---------- Check if result exists ----------
+    const resultDoc = await resultsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!resultDoc) {
+      return res.status(404).send({
+        message: "Result not found",
+      });
+    }
+
+    // ---------- Delete result ----------
+    const result = await resultsCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      message: "Result deleted successfully",
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to delete result",
+    });
+  }
+});
+
+// ==================== EXPENSE MANAGEMENT ROUTES ====================
+
+// CREATE - Add new expense
+app.post("/expenses", ensureDBConnection, async (req, res) => {
+  try {
+    const expense = req.body;
+
+    // Validate required fields
+    if (!expense.category || !expense.amount || !expense.date) {
+      return res.status(400).json({
+        success: false,
+        message: "Category, amount, and date are required",
+      });
+    }
+
+    // Create expense document with proper structure
+    const newExpense = {
+      category: expense.category, // e.g., "Salary", "Utilities", "Supplies", "Maintenance", "Marketing", "Other"
+      amount: parseFloat(expense.amount),
+      date: new Date(expense.date),
+      description: expense.description || "",
+      paymentMethod: expense.paymentMethod || "cash", // cash, bank, card, online
+      paidTo: expense.paidTo || "", // Person/Company name
+      receiptNumber: expense.receiptNumber || "",
+      notes: expense.notes || "",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await expensesCollection.insertOne(newExpense);
+
+    res.status(201).json({
+      success: true,
+      message: "Expense added successfully",
+      expenseId: result.insertedId,
+    });
+  } catch (error) {
+    console.error("Error adding expense:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to add expense",
+      error: error.message,
+    });
+  }
+});
+
+// READ - Get all expenses with optional filters
+app.get("/expenses", ensureDBConnection, async (req, res) => {
+  try {
+    const { category, startDate, endDate, paymentMethod } = req.query;
+    const filter = {};
+
+    // Filter by category
+    if (category) {
+      filter.category = category;
+    }
+
+    // Filter by payment method
+    if (paymentMethod) {
+      filter.paymentMethod = paymentMethod;
+    }
+
+    // Filter by date range
+    if (startDate || endDate) {
+      filter.date = {};
+      if (startDate) {
+        filter.date.$gte = new Date(startDate);
+      }
+      if (endDate) {
+        filter.date.$lte = new Date(endDate);
+      }
+    }
+
+    const expenses = await expensesCollection
+      .find(filter)
+      .sort({ date: -1 })
+      .toArray();
+
+    res.json({
+      success: true,
+      count: expenses.length,
+      data: expenses,
+    });
+  } catch (error) {
+    console.error("Error fetching expenses:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch expenses",
+      error: error.message,
+    });
+  }
+});
+
+// READ - Get single expense by ID
+app.get("/expenses/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense ID",
+      });
+    }
+
+    const expense = await expensesCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!expense) {
+      return res.status(404).json({
+        success: false,
+        message: "Expense not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      data: expense,
+    });
+  } catch (error) {
+    console.error("Error fetching expense:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch expense",
+      error: error.message,
+    });
+  }
+});
+
+// UPDATE - Update expense by ID
+app.patch("/expenses/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense ID",
+      });
+    }
+
+    // Prepare update document
+    const updateDoc = {
+      $set: {
+        ...updates,
+        updatedAt: new Date(),
+      },
+    };
+
+    // Convert amount to number if provided
+    if (updates.amount) {
+      updateDoc.$set.amount = parseFloat(updates.amount);
+    }
+
+    // Convert date to Date object if provided
+    if (updates.date) {
+      updateDoc.$set.date = new Date(updates.date);
+    }
+
+    const result = await expensesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Expense not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Expense updated successfully",
+    });
+  } catch (error) {
+    console.error("Error updating expense:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update expense",
+      error: error.message,
+    });
+  }
+});
+
+// DELETE - Delete expense by ID
+app.delete("/expenses/:id", ensureDBConnection, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense ID",
+      });
+    }
+
+    const result = await expensesCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Expense not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Expense deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error deleting expense:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete expense",
+      error: error.message,
+    });
+  }
+});
+
+// ANALYTICS - Get expense statistics
+app.get("/expenses/analytics/summary", ensureDBConnection, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const matchFilter = {};
+
+    // Filter by date range if provided
+    if (startDate || endDate) {
+      matchFilter.date = {};
+      if (startDate) {
+        matchFilter.date.$gte = new Date(startDate);
+      }
+      if (endDate) {
+        matchFilter.date.$lte = new Date(endDate);
+      }
+    }
+
+    // Aggregate expenses by category
+    const categoryStats = await expensesCollection
+      .aggregate([
+        { $match: matchFilter },
+        {
+          $group: {
+            _id: "$category",
+            totalAmount: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { totalAmount: -1 } },
+      ])
+      .toArray();
+
+    // Get total expenses
+    const totalExpenses = await expensesCollection
+      .aggregate([
+        { $match: matchFilter },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+      ])
+      .toArray();
+
+    // Get expenses by payment method
+    const paymentMethodStats = await expensesCollection
+      .aggregate([
+        { $match: matchFilter },
+        {
+          $group: {
+            _id: "$paymentMethod",
+            totalAmount: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+      ])
+      .toArray();
+
+    res.json({
+      success: true,
+      data: {
+        totalExpenses: totalExpenses[0]?.total || 0,
+        totalCount: totalExpenses[0]?.count || 0,
+        byCategory: categoryStats,
+        byPaymentMethod: paymentMethodStats,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching expense analytics:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch expense analytics",
+      error: error.message,
+    });
+  }
+});
+
+// Get distinct expense categories
+app.get("/expenses/categories/list", ensureDBConnection, async (req, res) => {
+  try {
+    const categories = await expensesCollection.distinct("category");
+
+    res.json({
+      success: true,
+      data: categories,
+    });
+  } catch (error) {
+    console.error("Error fetching categories:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch categories",
+      error: error.message,
     });
   }
 });
