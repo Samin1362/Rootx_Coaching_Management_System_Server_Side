@@ -1,31 +1,29 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { MongoClient, ServerApiVersion } from "mongodb";
-import { ObjectId } from "mongodb";
+import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-// middleware
+// ==================== MIDDLEWARE ====================
 app.use(express.json());
 app.use(
   cors({
     origin: [
       "http://localhost:5173",
       "http://localhost:5174",
-      "https://rootx-cms-firebase-project.web.app", // Replace with your actual frontend domain
+      "https://rootx-cms-firebase-project.web.app",
     ],
     credentials: true,
   })
 );
 
-// encode credentials
+// ==================== DATABASE CONNECTION ====================
 const user = encodeURIComponent(process.env.DB_USER);
 const pass = encodeURIComponent(process.env.DB_PASS);
-
 const uri = `mongodb+srv://${user}:${pass}@cluster0.l2cobj0.mongodb.net/rootxCMS?appName=Cluster0`;
 
 const client = new MongoClient(uri, {
@@ -36,8 +34,18 @@ const client = new MongoClient(uri, {
   },
 });
 
-// Database collections (will be initialized after connection)
+// Database collections
 let db;
+
+// NEW COLLECTIONS (Multi-tenant)
+let organizationsCollection;
+let subscriptionsCollection;
+let subscriptionPlansCollection;
+let paymentsCollection;
+let activityLogsCollection;
+let notificationsCollection;
+
+// EXISTING COLLECTIONS (Updated for multi-tenancy)
 let usersCollection;
 let studentsCollection;
 let admissionsCollection;
@@ -50,6 +58,7 @@ let expensesCollection;
 
 let isConnected = false;
 
+// ==================== DATABASE INITIALIZATION ====================
 async function connectDB() {
   if (isConnected && db) {
     return;
@@ -58,6 +67,16 @@ async function connectDB() {
   try {
     await client.connect();
     db = client.db("roots_coaching_management_users");
+
+    // Initialize NEW collections
+    organizationsCollection = db.collection("organizations");
+    subscriptionsCollection = db.collection("subscriptions");
+    subscriptionPlansCollection = db.collection("subscription_plans");
+    paymentsCollection = db.collection("payments");
+    activityLogsCollection = db.collection("activity_logs");
+    notificationsCollection = db.collection("notifications");
+
+    // Initialize EXISTING collections
     usersCollection = db.collection("users");
     studentsCollection = db.collection("students");
     admissionsCollection = db.collection("admissions");
@@ -67,8 +86,12 @@ async function connectDB() {
     examsCollection = db.collection("exams");
     resultsCollection = db.collection("results");
     expensesCollection = db.collection("expenses");
+
     isConnected = true;
     console.log("✅ Connected to MongoDB");
+
+    // Create indexes
+    await createIndexes();
   } catch (err) {
     console.error("❌ MongoDB connection error:", err);
     isConnected = false;
@@ -76,7 +99,108 @@ async function connectDB() {
   }
 }
 
-// Middleware to ensure DB connection
+// ==================== CREATE INDEXES ====================
+async function createIndexes() {
+  try {
+    // Organizations indexes
+    await organizationsCollection.createIndex({ slug: 1 }, { unique: true });
+    await organizationsCollection.createIndex({ email: 1 }, { unique: true });
+    await organizationsCollection.createIndex({ subscriptionStatus: 1 });
+    await organizationsCollection.createIndex({ ownerId: 1 });
+
+    // Subscriptions indexes
+    await subscriptionsCollection.createIndex(
+      { organizationId: 1 },
+      { unique: true }
+    );
+    await subscriptionsCollection.createIndex({ status: 1 });
+    await subscriptionsCollection.createIndex({ nextBillingDate: 1 });
+
+    // Subscription Plans indexes
+    await subscriptionPlansCollection.createIndex({ tier: 1 }, { unique: true });
+
+    // Payments indexes
+    await paymentsCollection.createIndex({ organizationId: 1 });
+    await paymentsCollection.createIndex({ subscriptionId: 1 });
+    await paymentsCollection.createIndex({ status: 1 });
+    await paymentsCollection.createIndex(
+      { invoiceNumber: 1 },
+      { unique: true, sparse: true }
+    );
+    await paymentsCollection.createIndex({ createdAt: -1 });
+
+    // Users indexes (UPDATED)
+    await usersCollection.createIndex({ email: 1 }, { unique: true });
+    await usersCollection.createIndex(
+      { firebaseUid: 1 },
+      { unique: true, sparse: true }
+    );
+    await usersCollection.createIndex({ organizationId: 1 });
+    await usersCollection.createIndex({ role: 1 });
+
+    // Students indexes (UPDATED)
+    await studentsCollection.createIndex({ organizationId: 1 });
+    await studentsCollection.createIndex(
+      { organizationId: 1, studentId: 1 },
+      { unique: true }
+    );
+    await studentsCollection.createIndex({ organizationId: 1, batchId: 1 });
+    await studentsCollection.createIndex({ organizationId: 1, status: 1 });
+
+    // Admissions indexes (UPDATED)
+    await admissionsCollection.createIndex({ organizationId: 1 });
+    await admissionsCollection.createIndex({ organizationId: 1, status: 1 });
+
+    // Batches indexes (UPDATED)
+    await batchesCollection.createIndex({ organizationId: 1 });
+    await batchesCollection.createIndex({ organizationId: 1, status: 1 });
+
+    // Fees indexes (UPDATED)
+    await feesCollection.createIndex({ organizationId: 1 });
+    await feesCollection.createIndex({ organizationId: 1, studentId: 1 });
+    await feesCollection.createIndex({ organizationId: 1, status: 1 });
+
+    // Attendance indexes (UPDATED)
+    await attendencesCollection.createIndex({ organizationId: 1 });
+    await attendencesCollection.createIndex(
+      { organizationId: 1, batchId: 1, date: 1 },
+      { unique: true }
+    );
+
+    // Exams indexes (UPDATED)
+    await examsCollection.createIndex({ organizationId: 1 });
+    await examsCollection.createIndex({ organizationId: 1, batchId: 1 });
+
+    // Results indexes (UPDATED)
+    await resultsCollection.createIndex({ organizationId: 1 });
+    await resultsCollection.createIndex(
+      { organizationId: 1, examId: 1, studentId: 1 },
+      { unique: true }
+    );
+
+    // Expenses indexes (UPDATED)
+    await expensesCollection.createIndex({ organizationId: 1 });
+    await expensesCollection.createIndex({ organizationId: 1, category: 1 });
+    await expensesCollection.createIndex({ organizationId: 1, date: -1 });
+
+    // Activity Logs indexes
+    await activityLogsCollection.createIndex({ organizationId: 1, createdAt: -1 });
+    await activityLogsCollection.createIndex({ userId: 1 });
+    await activityLogsCollection.createIndex({ resource: 1, resourceId: 1 });
+
+    // Notifications indexes
+    await notificationsCollection.createIndex({ userId: 1, isRead: 1 });
+    await notificationsCollection.createIndex({ organizationId: 1, createdAt: -1 });
+
+    console.log("✅ Indexes created successfully");
+  } catch (error) {
+    console.error("⚠️  Error creating indexes:", error.message);
+  }
+}
+
+// ==================== MIDDLEWARE FUNCTIONS ====================
+
+// Ensure DB connection
 const ensureDBConnection = async (req, res, next) => {
   try {
     if (!isConnected) {
@@ -92,211 +216,1215 @@ const ensureDBConnection = async (req, res, next) => {
   }
 };
 
+// Simple authentication middleware (checks if user exists)
+// Note: For production, implement Firebase Admin SDK token verification
+const authenticateUser = async (req, res, next) => {
+  try {
+    const email = req.headers["x-user-email"]; // Temporary: get from header
+    
+    if (!email) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
+    const user = await usersCollection.findOne({ email });
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Attach user to request
+    req.user = user;
+    req.userId = user._id;
+    req.organizationId = user.organizationId;
+    req.userRole = user.role;
+
+    next();
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Authentication failed",
+      error: error.message,
+    });
+  }
+};
+
+// Authorization middleware - check permissions
+const requirePermission = (permission) => {
+  return (req, res, next) => {
+    const { userRole } = req;
+
+    // Super admin has all permissions
+    if (userRole === "super_admin") {
+      return next();
+    }
+
+    // Define role permissions
+    const rolePermissions = {
+      org_owner: ["all"],
+      admin: [
+        "view_students",
+        "create_student",
+        "update_student",
+        "delete_student",
+        "view_batches",
+        "create_batch",
+        "update_batch",
+        "delete_batch",
+        "view_fees",
+        "create_fee",
+        "collect_payment",
+        "view_attendance",
+        "mark_attendance",
+        "view_exams",
+        "create_exam",
+        "enter_results",
+        "view_reports",
+        "export_data",
+        "manage_users",
+      ],
+      manager: [
+        "view_students",
+        "create_student",
+        "update_student",
+        "view_batches",
+        "create_batch",
+        "update_batch",
+        "view_fees",
+        "create_fee",
+        "collect_payment",
+        "view_attendance",
+        "mark_attendance",
+        "view_exams",
+        "view_reports",
+      ],
+      teacher: [
+        "view_students",
+        "view_batches",
+        "view_attendance",
+        "mark_attendance",
+        "view_exams",
+        "create_exam",
+        "enter_results",
+        "view_reports",
+      ],
+      staff: [
+        "view_students",
+        "view_batches",
+        "view_attendance",
+        "view_reports",
+      ],
+    };
+
+    const userPermissions = rolePermissions[userRole] || [];
+
+    if (
+      userPermissions.includes("all") ||
+      userPermissions.includes(permission)
+    ) {
+      return next();
+    }
+
+    res.status(403).json({
+      success: false,
+      message: "Insufficient permissions",
+      required: permission,
+    });
+  };
+};
+
+// Organization isolation middleware
+const enforceOrganizationIsolation = (req, res, next) => {
+  // Skip for super_admin
+  if (req.userRole === "super_admin") {
+    return next();
+  }
+
+  // Ensure organizationId is set
+  if (!req.organizationId) {
+    return res.status(403).json({
+      success: false,
+      message: "Organization context required",
+    });
+  }
+
+  next();
+};
+
+// Log activity
+async function logActivity(userId, organizationId, action, resource, resourceId, changes = null) {
+  try {
+    const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+    
+    await activityLogsCollection.insertOne({
+      organizationId: new ObjectId(organizationId),
+      userId: new ObjectId(userId),
+      userName: user?.name || "Unknown",
+      action,
+      resource,
+      resourceId,
+      changes,
+      ipAddress: null, // Can be extracted from req
+      userAgent: null,
+      createdAt: new Date(),
+    });
+  } catch (error) {
+    console.error("Error logging activity:", error);
+  }
+}
+
 // Initialize database connection
 connectDB().catch(console.dir);
 
 // ==================== API ROUTES ====================
 
-// users api's
-app.post("/users", ensureDBConnection, async (req, res) => {
-  try {
-    const user = req.body;
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    success: true,
+    message: "Server is healthy",
+    timestamp: new Date().toISOString(),
+  });
+});
 
-    // basic validation
-    if (!user.name || !user.email || !user.password || !user.role) {
-      return res.status(400).send({ message: "Required fields missing" });
+// Root endpoint
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "Rootx Coaching Management System API - Multi-Tenant",
+    version: "2.0.0",
+    status: "Running",
+  });
+});
+
+// ==================== ORGANIZATIONS API ====================
+
+// Create organization (Public signup)
+app.post("/organizations", ensureDBConnection, async (req, res) => {
+  try {
+    const {
+      name,
+      slug,
+      email,
+      phone,
+      address,
+      ownerName,
+      ownerEmail,
+      ownerPassword,
+      ownerPhotoURL,
+      ownerFirebaseUid,
+    } = req.body;
+
+    // Validation
+    if (!name || !slug || !email || !ownerEmail) {
+      return res.status(400).json({
+        success: false,
+        message: "Required fields missing",
+      });
     }
 
-    const newUser = {
-      name: user.name,
-      email: user.email,
-      phone: user.phone || "",
-      password: user.password,
+    // Check if slug or email already exists
+    const existing = await organizationsCollection.findOne({
+      $or: [{ slug }, { email }],
+    });
 
-      image: user.image || "",
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: "Organization with this slug or email already exists",
+      });
+    }
 
-      role: user.role, // admin | manager
+    // Create organization
+    const organization = {
+      name,
+      slug,
+      logo: "",
+      email,
+      phone: phone || "",
+      address: address || {},
+      subscriptionStatus: "trial",
+      subscriptionTier: "free",
+      limits: {
+        maxStudents: 50,
+        maxBatches: 3,
+        maxStaff: 2,
+        maxStorage: 100,
+        features: ["students", "batches", "basic_reports"],
+      },
+      usage: {
+        currentStudents: 0,
+        currentBatches: 0,
+        currentStaff: 1, // Owner
+        storageUsed: 0,
+      },
+      settings: {
+        timezone: "Asia/Dhaka",
+        currency: "BDT",
+        language: "en",
+        dateFormat: "DD/MM/YYYY",
+        fiscalYearStart: "01-01",
+      },
+      branding: {
+        primaryColor: "#3B82F6",
+        secondaryColor: "#10B981",
+        customDomain: "",
+      },
       status: "active",
-
-      lastLogin: null,
-
       createdAt: new Date(),
       updatedAt: new Date(),
     };
 
-    const result = await usersCollection.insertOne(newUser);
+    const orgResult = await organizationsCollection.insertOne(organization);
+    const organizationId = orgResult.insertedId;
 
-    res.status(201).send({
-      message: "User created successfully",
-      insertedId: result.insertedId,
-    });
-  } catch (error) {
-    res.status(500).send({ message: "Failed to create user" });
-  }
-});
-
-// students api's
-app.get("/students", ensureDBConnection, async (req, res) => {
-  try {
-    const { email, page = 1, limit = 10 } = req.query;
-
-    const query = {};
-
-    if (email) {
-      query.email = { $regex: email, $options: "i" };
-    }
-
-    const students = await studentsCollection
-      .find(query)
-      .skip((page - 1) * limit)
-      .limit(Number(limit))
-      .toArray();
-
-    res.send(students);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Failed to fetch students" });
-  }
-});
-
-app.post("/students", ensureDBConnection, async (req, res) => {
-  try {
-    const {
-      name,
-      image,
-      gender,
-      dob,
-      phone,
-      email,
-      address,
-      guardianName,
-      guardianPhone,
-      previousInstitute,
-      batchId,
-      status,
-      admissionDate,
-      documents,
-    } = req.body;
-
-    // basic validation
-    if (!name || !phone || !batchId) {
-      return res.status(400).send({ message: "Required fields missing" });
-    }
-
-    // Auto-generate roll number for the batch
-    // Find the highest roll number in this batch and increment by 1
-    const studentsInBatch = await studentsCollection
-      .find({ batchId })
-      .sort({ roll: -1 })
-      .limit(1)
-      .toArray();
-
-    const nextRoll =
-      studentsInBatch.length > 0 && studentsInBatch[0].roll
-        ? studentsInBatch[0].roll + 1
-        : 1;
-
-    const newStudent = {
-      studentId: `STD-${Date.now()}`, // simple unique ID
-      roll: nextRoll, // Auto-generated roll number per batch
-      name,
-      image: image || "",
-      gender: gender || "",
-      dob: dob || null,
-
-      phone,
-      email: email || "",
-      address: address || "",
-
-      guardianName: guardianName || "",
-      guardianPhone: guardianPhone || "",
-
-      previousInstitute: previousInstitute || "",
-      batchId,
-
-      status: status || "active",
-
-      documents: documents || [],
-
-      admissionDate: admissionDate ? new Date(admissionDate) : new Date(),
-
+    // Create owner user
+    const owner = {
+      name: ownerName || "Owner",
+      email: ownerEmail,
+      phone: phone || "",
+      password: ownerPassword || "", // Should be hashed (kept for backward compatibility)
+      image: ownerPhotoURL || "",
+      photoURL: ownerPhotoURL || "",
+      firebaseUid: ownerFirebaseUid || "",
+      organizationId,
+      role: "org_owner",
+      permissions: ["all"],
+      isSuperAdmin: false,
+      status: "active",
+      emailVerified: false,
+      lastLogin: null,
+      lastActivity: new Date(),
+      preferences: {
+        language: "en",
+        theme: "light",
+        notifications: {
+          email: true,
+          sms: false,
+          push: true,
+        },
+      },
       createdAt: new Date(),
+      updatedAt: new Date(),
     };
 
-    const result = await studentsCollection.insertOne(newStudent);
+    const userResult = await usersCollection.insertOne(owner);
 
-    res.status(201).send({
-      message: "Student added successfully",
-      insertedId: result.insertedId,
-      roll: nextRoll, // Return the generated roll number
+    // Update organization with ownerId
+    await organizationsCollection.updateOne(
+      { _id: organizationId },
+      { $set: { ownerId: userResult.insertedId } }
+    );
+
+    // Create trial subscription
+    const subscription = {
+      organizationId,
+      tier: "free",
+      status: "trial",
+      billingCycle: "monthly",
+      amount: 0,
+      currency: "BDT",
+      trialStartDate: new Date(),
+      trialEndDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000), // 14 days
+      isTrialUsed: true,
+      currentPeriodStart: new Date(),
+      currentPeriodEnd: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
+      nextBillingDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
+      cancelAtPeriodEnd: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    await subscriptionsCollection.insertOne(subscription);
+
+    res.status(201).json({
+      success: true,
+      message: "Organization created successfully",
+      data: {
+        organizationId,
+        slug,
+        ownerId: userResult.insertedId,
+      },
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Failed to add student" });
+    console.error("Error creating organization:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to create organization",
+      error: error.message,
+    });
   }
 });
 
-app.patch("/students/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
+// Get organization details
+app.get(
+  "/organizations/:id",
+  ensureDBConnection,
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-    // Validate ObjectId
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({
-        message: "Invalid student ID",
-      });
-    }
+      // Check permission
+      if (
+        req.userRole !== "super_admin" &&
+        req.organizationId.toString() !== id
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied",
+        });
+      }
 
-    const {
-      name,
-      image,
-      gender,
-      dob,
-      phone,
-      email,
-      address,
-      guardianName,
-      guardianPhone,
-      previousInstitute,
-      batchId,
-      status,
-      admissionDate,
-      documents,
-    } = req.body;
-
-    const updateDoc = {
-      $set: {},
-    };
-
-    // Basic info
-    if (name) updateDoc.$set.name = name;
-    if (image !== undefined) updateDoc.$set.image = image;
-    if (gender !== undefined) updateDoc.$set.gender = gender;
-    if (dob) updateDoc.$set.dob = dob;
-    if (phone) updateDoc.$set.phone = phone;
-    if (email !== undefined) updateDoc.$set.email = email;
-    if (address !== undefined) updateDoc.$set.address = address;
-
-    // Guardian info
-    if (guardianName !== undefined) updateDoc.$set.guardianName = guardianName;
-    if (guardianPhone !== undefined)
-      updateDoc.$set.guardianPhone = guardianPhone;
-
-    // Academic info
-    if (previousInstitute !== undefined)
-      updateDoc.$set.previousInstitute = previousInstitute;
-
-    // If batch is being changed, regenerate roll number for new batch
-    if (batchId) {
-      // Get current student to check if batch is actually changing
-      const currentStudent = await studentsCollection.findOne({
+      const organization = await organizationsCollection.findOne({
         _id: new ObjectId(id),
       });
 
-      if (currentStudent && currentStudent.batchId !== batchId) {
-        // Batch is changing, generate new roll number for the new batch
+      if (!organization) {
+        return res.status(404).json({
+          success: false,
+          message: "Organization not found",
+        });
+      }
+
+      res.json({
+        success: true,
+        data: organization,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch organization",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Update organization
+app.patch(
+  "/organizations/:id",
+  ensureDBConnection,
+  authenticateUser,
+  requirePermission("manage_organization"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const updates = req.body;
+
+      // Check permission
+      if (
+        req.userRole !== "super_admin" &&
+        req.userRole !== "org_owner" &&
+        req.organizationId.toString() !== id
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied",
+        });
+      }
+
+      // Remove fields that shouldn't be updated directly
+      delete updates._id;
+      delete updates.ownerId;
+      delete updates.subscriptionStatus;
+      delete updates.subscriptionTier;
+      delete updates.usage;
+
+      updates.updatedAt = new Date();
+
+      const result = await organizationsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updates }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Organization not found",
+        });
+      }
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        id,
+        "update",
+        "organization",
+        id,
+        updates
+      );
+
+      res.json({
+        success: true,
+        message: "Organization updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update organization",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get organization statistics
+app.get(
+  "/organizations/:id/stats",
+  ensureDBConnection,
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const orgId = new ObjectId(id);
+
+      // Check permission
+      if (
+        req.userRole !== "super_admin" &&
+        req.organizationId.toString() !== id
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied",
+        });
+      }
+
+      // Get counts
+      const totalStudents = await studentsCollection.countDocuments({
+        organizationId: orgId,
+        status: "active",
+      });
+
+      const totalBatches = await batchesCollection.countDocuments({
+        organizationId: orgId,
+        status: "active",
+      });
+
+      const totalStaff = await usersCollection.countDocuments({
+        organizationId: orgId,
+        status: "active",
+      });
+
+      const totalAdmissions = await admissionsCollection.countDocuments({
+        organizationId: orgId,
+      });
+
+      // Get financial stats
+      const feeStats = await feesCollection
+        .aggregate([
+          { $match: { organizationId: orgId } },
+          {
+            $group: {
+              _id: null,
+              totalRevenue: { $sum: "$paidAmount" },
+              totalDue: { $sum: "$dueAmount" },
+            },
+          },
+        ])
+        .toArray();
+
+      const stats = {
+        students: {
+          total: totalStudents,
+        },
+        batches: {
+          total: totalBatches,
+        },
+        staff: {
+          total: totalStaff,
+        },
+        admissions: {
+          total: totalAdmissions,
+        },
+        finance: {
+          totalRevenue: feeStats[0]?.totalRevenue || 0,
+          totalDue: feeStats[0]?.totalDue || 0,
+        },
+      };
+
+      res.json({
+        success: true,
+        data: stats,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch statistics",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SUBSCRIPTION PLANS API ====================
+
+// Get all subscription plans
+app.get("/subscriptions/plans", ensureDBConnection, async (req, res) => {
+  try {
+    const plans = await subscriptionPlansCollection
+      .find({ isActive: true })
+      .sort({ displayOrder: 1 })
+      .toArray();
+
+    res.json({
+      success: true,
+      data: plans,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch subscription plans",
+      error: error.message,
+    });
+  }
+});
+
+// Get subscription details
+app.get(
+  "/subscriptions/:id",
+  ensureDBConnection,
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const subscription = await subscriptionsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!subscription) {
+        return res.status(404).json({
+          success: false,
+          message: "Subscription not found",
+        });
+      }
+
+      // Check permission
+      if (
+        req.userRole !== "super_admin" &&
+        req.organizationId.toString() !== subscription.organizationId.toString()
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied",
+        });
+      }
+
+      res.json({
+        success: true,
+        data: subscription,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch subscription",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== USERS API (UPDATED) ====================
+
+// Register/Create user (Public endpoint - no auth required)
+app.post(
+  "/users/register",
+  ensureDBConnection,
+  async (req, res) => {
+    try {
+      const { name, email, firebaseUid, photoURL, organizationId, role = "admin" } = req.body;
+
+      // Validation
+      if (!name || !email || !firebaseUid) {
+        return res.status(400).json({
+          success: false,
+          message: "Name, email, and firebaseUid are required",
+        });
+      }
+
+      // Check if user already exists
+      const existingUser = await usersCollection.findOne({ email });
+      if (existingUser) {
+        return res.status(200).json({
+          success: true,
+          data: existingUser,
+          message: "User already exists",
+        });
+      }
+
+      // Create new user
+      const newUser = {
+        name,
+        email,
+        firebaseUid,
+        photoURL: photoURL || null,
+        organizationId: organizationId ? new ObjectId(organizationId) : null,
+        role: role,
+        status: "active",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await usersCollection.insertOne(newUser);
+      const user = await usersCollection.findOne({ _id: result.insertedId });
+
+      res.status(201).json({
+        success: true,
+        data: user,
+        message: "User registered successfully",
+      });
+    } catch (error) {
+      console.error("Registration error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to register user",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get current user (me) - No organization isolation needed
+app.get(
+  "/users/me",
+  ensureDBConnection,
+  authenticateUser,
+  async (req, res) => {
+    try {
+      // req.user is already populated by authenticateUser middleware
+      const user = { ...req.user };
+      delete user.password; // Remove password field for security
+
+      res.json({
+        success: true,
+        data: user,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch user data",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get all users (organization-scoped)
+app.get(
+  "/users",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("manage_users"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 10 } = req.query;
+
+      const users = await usersCollection
+        .find({
+          organizationId: req.organizationId,
+          status: { $ne: "deleted" },
+        })
+        .select("-password") // Exclude password
+        .skip((page - 1) * limit)
+        .limit(Number(limit))
+        .toArray();
+
+      const total = await usersCollection.countDocuments({
+        organizationId: req.organizationId,
+        status: { $ne: "deleted" },
+      });
+
+      res.json({
+        success: true,
+        data: users,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch users",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Invite user to organization
+app.post(
+  "/users/invite",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("manage_users"),
+  async (req, res) => {
+    try {
+      const { name, email, role, phone } = req.body;
+
+      // Validation
+      if (!name || !email || !role) {
+        return res.status(400).json({
+          success: false,
+          message: "Name, email, and role are required",
+        });
+      }
+
+      // Check if user already exists
+      const existing = await usersCollection.findOne({ email });
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          message: "User with this email already exists",
+        });
+      }
+
+      // Check staff limit
+      const org = await organizationsCollection.findOne({
+        _id: req.organizationId,
+      });
+
+      if (org.usage.currentStaff >= org.limits.maxStaff) {
+        return res.status(403).json({
+          success: false,
+          message: "Staff limit reached. Upgrade your plan to add more users.",
+        });
+      }
+
+      // Create user
+      const user = {
+        name,
+        email,
+        phone: phone || "",
+        password: "", // Will be set during first login
+        image: "",
+        firebaseUid: "",
+        organizationId: req.organizationId,
+        role,
+        permissions: [],
+        isSuperAdmin: false,
+        status: "active",
+        emailVerified: false,
+        lastLogin: null,
+        lastActivity: new Date(),
+        preferences: {
+          language: "en",
+          theme: "light",
+          notifications: {
+            email: true,
+            sms: false,
+            push: true,
+          },
+        },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await usersCollection.insertOne(user);
+
+      // Update organization staff count
+      await organizationsCollection.updateOne(
+        { _id: req.organizationId },
+        { $inc: { "usage.currentStaff": 1 } }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "create",
+        "user",
+        result.insertedId.toString()
+      );
+
+      // TODO: Send invitation email
+
+      res.status(201).json({
+        success: true,
+        message: "User invited successfully",
+        data: {
+          userId: result.insertedId,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to invite user",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Update user role
+app.patch(
+  "/users/:id/role",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("manage_users"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { role } = req.body;
+
+      if (!role) {
+        return res.status(400).json({
+          success: false,
+          message: "Role is required",
+        });
+      }
+
+      // Check if user belongs to organization
+      const user = await usersCollection.findOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
+      });
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      // Cannot change org_owner role
+      if (user.role === "org_owner") {
+        return res.status(403).json({
+          success: false,
+          message: "Cannot change organization owner role",
+        });
+      }
+
+      const result = await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            role,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "update",
+        "user",
+        id,
+        { role }
+      );
+
+      res.json({
+        success: true,
+        message: "User role updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update user role",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Remove user from organization
+app.delete(
+  "/users/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("manage_users"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      // Check if user belongs to organization
+      const user = await usersCollection.findOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
+      });
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      // Cannot delete org_owner
+      if (user.role === "org_owner") {
+        return res.status(403).json({
+          success: false,
+          message: "Cannot delete organization owner",
+        });
+      }
+
+      // Soft delete
+      await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status: "deleted",
+            deletedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Update organization staff count
+      await organizationsCollection.updateOne(
+        { _id: req.organizationId },
+        { $inc: { "usage.currentStaff": -1 } }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "delete",
+        "user",
+        id
+      );
+
+      res.json({
+        success: true,
+        message: "User removed successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to remove user",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== STUDENTS API (UPDATED) ====================
+
+// Get all students (organization-scoped)
+app.get(
+  "/students",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("view_students"),
+  async (req, res) => {
+    try {
+      const { email, page = 1, limit = 10 } = req.query;
+
+      const query = { organizationId: req.organizationId };
+
+      if (email) {
+        query.email = { $regex: email, $options: "i" };
+      }
+
+      const students = await studentsCollection
+        .find(query)
+        .skip((page - 1) * limit)
+        .limit(Number(limit))
+        .toArray();
+
+      const total = await studentsCollection.countDocuments(query);
+
+      res.json({
+        success: true,
+        data: students,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch students",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Create student (organization-scoped)
+app.post(
+  "/students",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("create_student"),
+  async (req, res) => {
+    try {
+      const {
+        name,
+        image,
+        gender,
+        dob,
+        phone,
+        email,
+        address,
+        guardianName,
+        guardianPhone,
+        previousInstitute,
+        batchId,
+        status,
+        admissionDate,
+        documents,
+      } = req.body;
+
+      // Validation
+      if (!name || !phone || !batchId) {
+        return res.status(400).json({
+          success: false,
+          message: "Required fields missing",
+        });
+      }
+
+      // Check student limit
+      const org = await organizationsCollection.findOne({
+        _id: req.organizationId,
+      });
+
+      if (
+        org.limits.maxStudents !== -1 &&
+        org.usage.currentStudents >= org.limits.maxStudents
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Student limit reached. Upgrade your plan to add more students.",
+        });
+      }
+
+      // Auto-generate roll number
+      const studentsInBatch = await studentsCollection
+        .find({ organizationId: req.organizationId, batchId })
+        .sort({ roll: -1 })
+        .limit(1)
+        .toArray();
+
+      const nextRoll =
+        studentsInBatch.length > 0 && studentsInBatch[0].roll
+          ? studentsInBatch[0].roll + 1
+          : 1;
+
+      const newStudent = {
+        organizationId: req.organizationId,
+        studentId: `STD-${Date.now()}`,
+        roll: nextRoll,
+        name,
+        image: image || "",
+        gender: gender || "",
+        dob: dob || null,
+        phone,
+        email: email || "",
+        address: address || "",
+        guardianName: guardianName || "",
+        guardianPhone: guardianPhone || "",
+        previousInstitute: previousInstitute || "",
+        batchId,
+        status: status || "active",
+        documents: documents || [],
+        admissionDate: admissionDate ? new Date(admissionDate) : new Date(),
+        createdBy: req.userId,
+        updatedBy: req.userId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await studentsCollection.insertOne(newStudent);
+
+      // Update organization student count
+      await organizationsCollection.updateOne(
+        { _id: req.organizationId },
+        { $inc: { "usage.currentStudents": 1 } }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "create",
+        "student",
+        result.insertedId.toString()
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Student added successfully",
+        data: {
+          insertedId: result.insertedId,
+          roll: nextRoll,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to add student",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Update student (organization-scoped)
+app.patch(
+  "/students/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("update_student"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid student ID",
+        });
+      }
+
+      // Check if student belongs to organization
+      const student = await studentsCollection.findOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
+      });
+
+      if (!student) {
+        return res.status(404).json({
+          success: false,
+          message: "Student not found",
+        });
+      }
+
+      const updates = { ...req.body };
+      delete updates._id;
+      delete updates.organizationId;
+      delete updates.createdBy;
+      delete updates.createdAt;
+
+      updates.updatedBy = req.userId;
+      updates.updatedAt = new Date();
+
+      // Handle batch change
+      if (updates.batchId && updates.batchId !== student.batchId) {
         const studentsInNewBatch = await studentsCollection
-          .find({ batchId })
+          .find({ organizationId: req.organizationId, batchId: updates.batchId })
           .sort({ roll: -1 })
           .limit(1)
           .toArray();
@@ -306,1238 +1434,1540 @@ app.patch("/students/:id", ensureDBConnection, async (req, res) => {
             ? studentsInNewBatch[0].roll + 1
             : 1;
 
-        updateDoc.$set.roll = nextRoll;
+        updates.roll = nextRoll;
       }
 
-      updateDoc.$set.batchId = batchId;
-    }
+      const result = await studentsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updates }
+      );
 
-    // Status & documents
-    if (status) updateDoc.$set.status = status;
-    if (Array.isArray(documents)) updateDoc.$set.documents = documents;
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "update",
+        "student",
+        id,
+        updates
+      );
 
-    // Admission date
-    if (admissionDate) updateDoc.$set.admissionDate = new Date(admissionDate);
-
-    // If no fields provided
-    if (Object.keys(updateDoc.$set).length === 0) {
-      return res.status(400).send({
-        message: "No valid fields provided for update",
+      res.json({
+        success: true,
+        message: "Student updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update student",
+        error: error.message,
       });
     }
-
-    const result = await studentsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      updateDoc
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send({
-        message: "Student not found",
-      });
-    }
-
-    res.send({
-      message: "Student updated successfully",
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to update student",
-    });
   }
-});
+);
 
-app.delete("/students/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
+// Delete student (organization-scoped)
+app.delete(
+  "/students/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("delete_student"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-    // Validate ObjectId
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({
-        message: "Invalid student ID",
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid student ID",
+        });
+      }
+
+      // Check if student belongs to organization
+      const student = await studentsCollection.findOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
+      });
+
+      if (!student) {
+        return res.status(404).json({
+          success: false,
+          message: "Student not found",
+        });
+      }
+
+      // Soft delete
+      await studentsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status: "deleted",
+            deletedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Update organization student count
+      await organizationsCollection.updateOne(
+        { _id: req.organizationId },
+        { $inc: { "usage.currentStudents": -1 } }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "delete",
+        "student",
+        id
+      );
+
+      res.json({
+        success: true,
+        message: "Student deleted successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete student",
+        error: error.message,
       });
     }
+  }
+);
 
-    // Check if student exists
-    const student = await studentsCollection.findOne({
-      _id: new ObjectId(id),
-    });
+// ==================== BATCHES API (UPDATED) ====================
 
-    if (!student) {
-      return res.status(404).send({
-        message: "Student not found",
+// Get all batches (organization-scoped)
+app.get(
+  "/batches",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("view_batches"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 10 } = req.query;
+
+      const batches = await batchesCollection
+        .find({ organizationId: req.organizationId })
+        .skip((page - 1) * limit)
+        .limit(Number(limit))
+        .toArray();
+
+      const total = await batchesCollection.countDocuments({
+        organizationId: req.organizationId,
       });
-    }
 
-    // Delete student
-    const result = await studentsCollection.deleteOne({
-      _id: new ObjectId(id),
-    });
-
-    res.send({
-      message: "Student deleted successfully",
-      deletedId: id,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to delete student",
-    });
-  }
-});
-
-// admissions api's
-app.get("/admissions", ensureDBConnection, async (req, res) => {
-  try {
-    const { email, phone, name, status, page = 1, limit = 10 } = req.query;
-
-    const query = {};
-
-    // Search filters
-    if (email) {
-      query.email = { $regex: email, $options: "i" };
-    }
-
-    if (phone) {
-      query.phone = { $regex: phone, $options: "i" };
-    }
-
-    if (name) {
-      query.name = { $regex: name, $options: "i" };
-    }
-
-    // Status filter
-    if (status) {
-      query.status = status;
-    }
-
-    const admissions = await admissionsCollection
-      .find(query)
-      .sort({ createdAt: -1 }) // latest first
-      .skip((page - 1) * Number(limit))
-      .limit(Number(limit))
-      .toArray();
-
-    res.send(admissions);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Failed to fetch admissions" });
-  }
-});
-
-app.post("/admissions", ensureDBConnection, async (req, res) => {
-  try {
-    const { name, phone, email, interestedBatchId, createdBy } = req.body;
-
-    // Basic validation
-    if (!name || !phone) {
-      return res.status(400).send({
-        message: "Name and phone are required",
-      });
-    }
-
-    const admission = {
-      name,
-      phone,
-      email: email || null,
-      interestedBatchId: interestedBatchId || null,
-
-      status: "inquiry", // default status
-
-      followUps: [],
-
-      createdBy: createdBy || null,
-      createdAt: new Date(),
-    };
-
-    const result = await admissionsCollection.insertOne(admission);
-
-    res.status(201).send({
-      message: "Admission created successfully",
-      insertedId: result.insertedId,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to create admission",
-    });
-  }
-});
-
-app.patch("/admissions/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const {
-      name,
-      phone,
-      email,
-      interestedBatchId,
-      status,
-      followUpNote,
-      followUpDate,
-      followUps,
-    } = req.body;
-
-    const updateDoc = {
-      $set: {},
-    };
-
-    // Basic field updates
-    if (name) updateDoc.$set.name = name;
-    if (phone) updateDoc.$set.phone = phone;
-    if (email) updateDoc.$set.email = email;
-    if (interestedBatchId) updateDoc.$set.interestedBatchId = interestedBatchId;
-
-    // Status update
-    if (status) {
-      updateDoc.$set.status = status;
-      // inquiry | follow-up | enrolled | rejected
-    }
-
-    // Handle follow-ups: either replace array (delete) OR add new entry (add)
-    // Cannot do both $set and $push on same field simultaneously
-    if (followUps !== undefined) {
-      // Replace entire followUps array (used when deleting a follow-up)
-      console.log("Replacing followUps array with:", followUps);
-      updateDoc.$set.followUps = followUps;
-    } else if (followUpNote) {
-      // Add follow-up entry (for add operation)
-      console.log("Adding new follow-up:", followUpNote);
-      updateDoc.$push = {
-        followUps: {
-          note: followUpNote,
-          date: followUpDate ? new Date(followUpDate) : new Date(),
+      res.json({
+        success: true,
+        data: batches,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          pages: Math.ceil(total / limit),
         },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch batches",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Create batch (organization-scoped)
+app.post(
+  "/batches",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("create_batch"),
+  async (req, res) => {
+    try {
+      const {
+        name,
+        course,
+        schedule,
+        startDate,
+        endDate,
+        capacity,
+        instructor,
+        status,
+        fees,
+      } = req.body;
+
+      // Validation
+      if (!name || !course) {
+        return res.status(400).json({
+          success: false,
+          message: "Batch name and course are required",
+        });
+      }
+
+      // Check batch limit
+      const org = await organizationsCollection.findOne({
+        _id: req.organizationId,
+      });
+
+      if (
+        org.limits.maxBatches !== -1 &&
+        org.usage.currentBatches >= org.limits.maxBatches
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Batch limit reached. Upgrade your plan to add more batches.",
+        });
+      }
+
+      const newBatch = {
+        organizationId: req.organizationId,
+        name,
+        course,
+        schedule: schedule || "",
+        fees: Number(fees) || 0,
+        startDate: startDate ? new Date(startDate) : null,
+        endDate: endDate ? new Date(endDate) : null,
+        capacity: capacity || 0,
+        instructor: instructor || "",
+        status: status || "active",
+        createdBy: req.userId,
+        updatedBy: req.userId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
       };
 
-      // Auto-move to follow-up stage if needed
-      updateDoc.$set.status = "follow-up";
-    }
+      const result = await batchesCollection.insertOne(newBatch);
 
-    // If no update fields provided
-    if (Object.keys(updateDoc.$set).length === 0 && !updateDoc.$push) {
-      return res.status(400).send({
-        message: "No valid fields provided for update",
+      // Update organization batch count
+      await organizationsCollection.updateOne(
+        { _id: req.organizationId },
+        { $inc: { "usage.currentBatches": 1 } }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "create",
+        "batch",
+        result.insertedId.toString()
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Batch created successfully",
+        data: {
+          insertedId: result.insertedId,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to create batch",
+        error: error.message,
       });
     }
-
-    const result = await admissionsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      updateDoc
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send({
-        message: "Admission not found",
-      });
-    }
-
-    res.send({
-      message: "Admission updated successfully",
-      modifiedCount: result.modifiedCount,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: "Failed to update admission",
-      error: error.message,
-    });
   }
-});
+);
 
-app.delete("/admissions/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
+// ==================== FEES API (ADDED) ====================
 
-    const result = await admissionsCollection.deleteOne({
-      _id: new ObjectId(id),
-    });
+// Get all fees (organization-scoped)
+app.get(
+  "/fees",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("view_fees"),
+  async (req, res) => {
+    try {
+      const { search, status, page = 1, limit = 1000 } = req.query; // Default limit 1000 to avoid pagination issues for now
+      const query = { organizationId: req.organizationId };
 
-    if (result.deletedCount === 0) {
-      return res.status(404).send({
-        message: "Admission not found",
+      if (search) {
+        query.$or = [
+          { studentName: { $regex: search, $options: "i" } },
+          { batchName: { $regex: search, $options: "i" } }
+        ];
+      }
+      if (status) query.status = status;
+
+      let fees = await feesCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip((Number(page) - 1) * Number(limit))
+        .limit(Number(limit))
+        .toArray();
+
+      // Ensure all fee records have proper structure
+      fees = fees.map(fee => ({
+        ...fee,
+        fees: Number(fee.fees) || 0,
+        paidAmount: Number(fee.paidAmount) || 0,
+        dueAmount: Number(fee.dueAmount) || 0,
+        payments: Array.isArray(fee.payments) ? fee.payments : [],
+        status: fee.status || (fee.dueAmount > 0 ? 'due' : 'clear')
+      }));
+
+      res.json({
+        success: true,
+        data: fees,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total: fees.length, // Approximate for now, or use countDocuments
+        }
       });
+    } catch (error) {
+       res.status(500).json({ success: false, message: error.message });
     }
-
-    res.send({
-      message: "Admission deleted successfully",
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to delete admission",
-    });
   }
-});
+);
 
-// batches api's
-app.get("/batches", ensureDBConnection, async (req, res) => {
-  try {
-    const { name, course, status, page = 1, limit = 10 } = req.query;
 
-    const query = {};
+// Create fee (organization-scoped)
+app.post(
+  "/fees",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("create_fee"),
+  async (req, res) => {
+    try {
+      const fee = req.body;
+      fee.organizationId = req.organizationId;
+      fee.createdAt = new Date();
+      fee.updatedAt = new Date();
+      fee.createdBy = req.userId;
 
-    // Search filters
-    if (name) {
-      query.name = { $regex: name, $options: "i" };
+      // Ensure numeric values
+      if (fee.fees) fee.fees = Number(fee.fees);
+      if (fee.paidAmount) fee.paidAmount = Number(fee.paidAmount);
+
+      // Calculate due amount if not provided or ensure it's correct
+      if (fee.dueAmount === undefined || fee.dueAmount === null) {
+          fee.dueAmount = (fee.fees || 0) - (fee.paidAmount || 0);
+      } else {
+          fee.dueAmount = Number(fee.dueAmount);
+      }
+
+      // Determine status dynamically
+      // If due amount is 0 or less, it's cleared.
+      fee.status = fee.dueAmount <= 0 ? "clear" : "due";
+
+      // Initialize payments array
+      fee.payments = [];
+
+      // If there's an initial payment, add it to payments array
+      if (fee.paidAmount && fee.paidAmount > 0) {
+        fee.payments.push({
+          amount: fee.paidAmount,
+          method: fee.paymentMethod || "cash",
+          date: new Date(),
+          recordedBy: req.userId
+        });
+      }
+
+      const result = await feesCollection.insertOne(fee);
+
+      await logActivity(req.userId, req.organizationId, "create", "fee", result.insertedId.toString());
+
+      // Return insertedId at root level to match NewFeeEntry.jsx expectation
+      res.status(201).json({
+          success: true,
+          message: "Fee created successfully",
+          insertedId: result.insertedId
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, message: "Failed to create fee", error: error.message });
     }
-
-    if (course) {
-      query.course = { $regex: course, $options: "i" };
-    }
-
-    // Status filter
-    if (status) {
-      query.status = status; // active | completed
-    }
-
-    const batches = await batchesCollection
-      .find(query)
-      .sort({ createdAt: -1 }) // latest first
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit))
-      .toArray();
-
-    res.send(batches);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to fetch batches",
-    });
   }
-});
+);
 
-app.post("/batches", ensureDBConnection, async (req, res) => {
-  try {
-    const {
-      name,
-      course,
-      schedule,
-      totalFee,
-      capacity,
-      startDate,
-      endDate,
-      status,
-    } = req.body;
+// Update fee payment (organization-scoped)
+app.patch(
+  "/fees/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("collect_payment"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { amount, paymentMethod } = req.body;
 
-    // Basic validation
-    if (!name || !course || !schedule || !totalFee || !capacity || !startDate) {
-      return res.status(400).send({
-        message: "Required fields are missing",
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ success: false, message: "Invalid fee ID" });
+      }
+
+      const fee = await feesCollection.findOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
       });
-    }
 
-    const batch = {
-      name,
-      course,
-      schedule, // "Sun–Thu 7–9 PM"
-      totalFee: Number(totalFee),
-      capacity: Number(capacity),
-      startDate: new Date(startDate),
-      endDate: endDate ? new Date(endDate) : null,
-      status: status || "active", // active | completed
-      createdAt: new Date(),
-    };
+      if (!fee) {
+        return res.status(404).json({ success: false, message: "Fee entry not found" });
+      }
 
-    const result = await batchesCollection.insertOne(batch);
+      const paymentAmount = Number(amount);
+      if (isNaN(paymentAmount) || paymentAmount <= 0) {
+        return res.status(400).json({ success: false, message: "Invalid payment amount" });
+      }
 
-    res.send({
-      message: "Batch created successfully",
-      insertedId: result.insertedId,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to create batch",
-    });
-  }
-});
+      // Calculate new amounts
+      const currentPaidAmount = Number(fee.paidAmount) || 0;
+      const totalFee = Number(fee.fees) || 0;
+      const newPaidAmount = currentPaidAmount + paymentAmount;
+      const newDueAmount = Math.max(0, totalFee - newPaidAmount);
+      const newStatus = newDueAmount <= 0 ? "clear" : "due";
 
-// fees api's
-app.get("/fees", ensureDBConnection, async (req, res) => {
-  try {
-    const {
-      studentId,
-      batchId,
-      status, // clear | due
-      page = 1,
-      limit = 10,
-    } = req.query;
+      // Validate payment doesn't exceed due amount
+      const currentDueAmount = Number(fee.dueAmount) || 0;
+      if (paymentAmount > currentDueAmount) {
+        return res.status(400).json({
+          success: false,
+          message: "Payment amount cannot exceed due amount"
+        });
+      }
 
-    const query = {};
+      // Create payment history entry
+      const paymentHistoryEntry = {
+        amount: paymentAmount,
+        method: paymentMethod || "cash",
+        date: new Date(),
+        recordedBy: req.userId
+      };
 
-    // Filters
-    if (studentId) {
-      query.studentId = studentId;
-    }
-
-    if (batchId) {
-      query.batchId = batchId;
-    }
-
-    if (status) {
-      query.status = status;
-    }
-
-    const fees = await feesCollection
-      .find(query)
-      .sort({ createdAt: -1 }) // latest first
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit))
-      .toArray();
-
-    res.send(fees);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to fetch fees",
-    });
-  }
-});
-
-app.post("/fees", ensureDBConnection, async (req, res) => {
-  try {
-    const {
-      studentId,
-      batchId,
-      totalFee,
-      paidAmount,
-      paymentMethod, // cash | online (initial payment)
-    } = req.body;
-
-    // Basic validation
-    if (!studentId || !batchId || !totalFee) {
-      return res.status(400).send({
-        message: "Required fields are missing",
-      });
-    }
-
-    const paid = Number(paidAmount) || 0;
-    const total = Number(totalFee);
-    const due = total - paid;
-
-    const feeDoc = {
-      studentId,
-      batchId,
-      totalFee: total,
-      paidAmount: paid,
-      dueAmount: due,
-      payments:
-        paid > 0
-          ? [
-              {
-                amount: paid,
-                method: paymentMethod || "cash",
-                date: new Date(),
-              },
-            ]
-          : [],
-      status: due === 0 ? "clear" : "due", // clear | due
-      lastPaymentDate: paid > 0 ? new Date() : null,
-      createdAt: new Date(),
-    };
-
-    const result = await feesCollection.insertOne(feeDoc);
-
-    res.send({
-      message: "Fee record created successfully",
-      insertedId: result.insertedId,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to create fee record",
-    });
-  }
-});
-
-app.patch("/fees/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { amount, paymentMethod } = req.body;
-
-    // Validation
-    if (!amount || Number(amount) <= 0) {
-      return res.status(400).send({
-        message: "Valid payment amount is required",
-      });
-    }
-
-    // Find existing fee record
-    const fee = await feesCollection.findOne({
-      _id: new ObjectId(id),
-    });
-
-    if (!fee) {
-      return res.status(404).send({
-        message: "Fee record not found",
-      });
-    }
-
-    const paymentAmount = Number(amount);
-    const newPaidAmount = fee.paidAmount + paymentAmount;
-    const newDueAmount = fee.totalFee - newPaidAmount;
-
-    if (newPaidAmount > fee.totalFee) {
-      return res.status(400).send({
-        message: "Payment exceeds total fee",
-      });
-    }
-
-    const updateDoc = {
-      $set: {
+      // Prepare updates
+      const updates = {
         paidAmount: newPaidAmount,
         dueAmount: newDueAmount,
-        status: newDueAmount === 0 ? "clear" : "due",
-        lastPaymentDate: new Date(),
-      },
-      $push: {
-        payments: {
+        status: newStatus,
+        updatedAt: new Date(),
+        updatedBy: req.userId
+      };
+
+      // Update the Fee record with payment history
+      await feesCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: updates,
+          $push: { payments: paymentHistoryEntry }
+        }
+      );
+
+      // Log the payment in paymentsCollection for audit trail
+      if (typeof paymentsCollection !== 'undefined') {
+        const paymentRecord = {
+          organizationId: req.organizationId,
+          studentId: fee.studentId,
+          feeId: new ObjectId(id),
           amount: paymentAmount,
           method: paymentMethod || "cash",
           date: new Date(),
-        },
-      },
-    };
+          createdBy: req.userId,
+        };
+        await paymentsCollection.insertOne(paymentRecord);
+      }
 
-    const result = await feesCollection.updateOne(
-      { _id: new ObjectId(id) },
-      updateDoc
-    );
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "update",
+        "fee",
+        id,
+        { payment: paymentAmount, method: paymentMethod }
+      );
 
-    res.send({
-      message: "Payment added successfully",
-      updatedStatus: updateDoc.$set.status,
-      dueAmount: newDueAmount,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to add payment",
-    });
-  }
-});
+      // Return response matching frontend expectations
+      res.json({
+        success: true,
+        message: "Payment recorded successfully",
+        updatedStatus: newStatus,
+        dueAmount: newDueAmount,
+        paidAmount: newPaidAmount,
+        data: {
+          _id: fee._id,
+          studentId: fee.studentId,
+          batchId: fee.batchId,
+          fees: totalFee,
+          paidAmount: newPaidAmount,
+          dueAmount: newDueAmount,
+          status: newStatus,
+          updatedAt: updates.updatedAt
+        }
+      });
 
-app.delete("/fees/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    // ---------- Validation ----------
-    if (!id) {
-      return res.status(400).send({
-        message: "Fee ID is required",
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to record payment",
+        error: error.message
       });
     }
-
-    // ---------- Check if fee record exists ----------
-    const fee = await feesCollection.findOne({
-      _id: new ObjectId(id),
-    });
-
-    if (!fee) {
-      return res.status(404).send({
-        message: "Fee record not found",
-      });
-    }
-
-    // ---------- Delete fee record ----------
-    const result = await feesCollection.deleteOne({
-      _id: new ObjectId(id),
-    });
-
-    res.send({
-      message: "Fee record deleted successfully",
-      deletedCount: result.deletedCount,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to delete fee record",
-    });
   }
-});
+);
 
-// attendence api's
-app.get("/attendences", ensureDBConnection, async (req, res) => {
-  try {
-    const { batchId, date, takenBy, page = 1, limit = 10 } = req.query;
+// Update batch (organization-scoped)
+app.patch(
+  "/batches/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("update_batch"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-    const query = {};
-
-    // Filter by batch
-    if (batchId) {
-      query.batchId = batchId;
-    }
-
-    // Filter by date (single day)
-    if (date) {
-      const selectedDate = new Date(date);
-      selectedDate.setHours(0, 0, 0, 0);
-
-      const nextDay = new Date(selectedDate);
-      nextDay.setDate(nextDay.getDate() + 1);
-
-      query.date = {
-        $gte: selectedDate,
-        $lt: nextDay,
-      };
-    }
-
-    // Filter by attendance taker
-    if (takenBy) {
-      query.takenBy = takenBy;
-    }
-
-    const attendences = await attendencesCollection
-      .find(query)
-      .sort({ date: -1 }) // latest attendance first
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit))
-      .toArray();
-
-    res.send(attendences);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to fetch attendance records",
-    });
-  }
-});
-
-app.post("/attendences", ensureDBConnection, async (req, res) => {
-  try {
-    const {
-      date,
-      batchId,
-      records, // [{ studentId, status }]
-      takenBy,
-    } = req.body;
-
-    // ---------- Basic validation ----------
-    if (!date || !batchId || !Array.isArray(records) || records.length === 0) {
-      return res.status(400).send({
-        message: "Required fields are missing",
-      });
-    }
-
-    // Validate each attendance record
-    for (const record of records) {
-      if (
-        !record.studentId ||
-        !record.status ||
-        !["present", "absent"].includes(record.status)
-      ) {
-        return res.status(400).send({
-          message: "Invalid attendance record format",
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid batch ID",
         });
       }
-    }
 
-    // ---------- Prevent duplicate attendance (same date + batch) ----------
-    const existingAttendance = await attendencesCollection.findOne({
-      date: new Date(date),
-      batchId,
-    });
-
-    if (existingAttendance) {
-      return res.status(409).send({
-        message: "Attendance already taken for this batch on this date",
+      // Check if batch belongs to organization
+      const batch = await batchesCollection.findOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
       });
-    }
 
-    // ---------- Create attendance document ----------
-    const attendanceDoc = {
-      date: new Date(date),
-      batchId,
-      records: records.map((r) => ({
-        studentId: r.studentId,
-        status: r.status, // present | absent
-      })),
-      takenBy: takenBy || "admin", // replace later with logged-in user
-      createdAt: new Date(),
-    };
-
-    const result = await attendencesCollection.insertOne(attendanceDoc);
-
-    res.send({
-      message: "Attendance recorded successfully",
-      insertedId: result.insertedId,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to record attendance",
-    });
-  }
-});
-
-// performance api's
-app.get("/exams", ensureDBConnection, async (req, res) => {
-  try {
-    const { batchId, name, page = 1, limit = 10 } = req.query;
-
-    const query = {};
-
-    if (batchId) {
-      query.batchId = batchId;
-    }
-
-    if (name) {
-      query.name = { $regex: name, $options: "i" };
-    }
-
-    const exams = await examsCollection
-      .find(query)
-      .sort({ date: -1 })
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit))
-      .toArray();
-
-    res.send(exams);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to fetch exams",
-    });
-  }
-});
-
-app.post("/exams", ensureDBConnection, async (req, res) => {
-  try {
-    const { name, batchId, totalMarks, date } = req.body;
-
-    // ---------- Validation ----------
-    if (!name || !batchId || !totalMarks || !date) {
-      return res.status(400).send({
-        message: "Required fields are missing",
-      });
-    }
-
-    const exam = {
-      name,
-      batchId,
-      totalMarks: Number(totalMarks),
-      date: new Date(date),
-      createdAt: new Date(),
-    };
-
-    const result = await examsCollection.insertOne(exam);
-
-    res.status(201).send({
-      message: "Exam created successfully",
-      insertedId: result.insertedId,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to create exam",
-    });
-  }
-});
-
-app.delete("/exams", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.query;
-
-    // ---------- Validation ----------
-    if (!id) {
-      return res.status(400).send({
-        message: "Exam ID is required",
-      });
-    }
-
-    // ---------- Check if exam exists ----------
-    const exam = await examsCollection.findOne({
-      _id: new ObjectId(id),
-    });
-
-    if (!exam) {
-      return res.status(404).send({
-        message: "Exam not found",
-      });
-    }
-
-    // ---------- Optional: prevent deletion if results exist ----------
-    const relatedResults = await resultsCollection.findOne({
-      examId: id,
-    });
-
-    if (relatedResults) {
-      return res.status(409).send({
-        message:
-          "Cannot delete exam because results already exist for this exam",
-      });
-    }
-
-    // ---------- Delete exam ----------
-    const result = await examsCollection.deleteOne({
-      _id: new ObjectId(id),
-    });
-
-    res.send({
-      message: "Exam deleted successfully",
-      deletedCount: result.deletedCount,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to delete exam",
-    });
-  }
-});
-
-app.get("/results", ensureDBConnection, async (req, res) => {
-  try {
-    const { examId, studentId, page = 1, limit = 10 } = req.query;
-
-    const query = {};
-
-    if (examId) {
-      query.examId = examId;
-    }
-
-    if (studentId) {
-      query.studentId = studentId;
-    }
-
-    const results = await resultsCollection
-      .find(query)
-      .sort({ createdAt: -1 })
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit))
-      .toArray();
-
-    res.send(results);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to fetch results",
-    });
-  }
-});
-
-app.post("/results", ensureDBConnection, async (req, res) => {
-  try {
-    const { examId, studentId, marks, grade } = req.body;
-
-    // ---------- Validation ----------
-    if (!examId || !studentId || marks === undefined) {
-      return res.status(400).send({
-        message: "Required fields are missing",
-      });
-    }
-
-    // ---------- Prevent duplicate result ----------
-    const existingResult = await resultsCollection.findOne({
-      examId,
-      studentId,
-    });
-
-    if (existingResult) {
-      return res.status(409).send({
-        message: "Result already exists for this student in this exam",
-      });
-    }
-
-    const resultDoc = {
-      examId,
-      studentId,
-      marks: Number(marks),
-      grade: grade || "",
-      createdAt: new Date(),
-    };
-
-    const result = await resultsCollection.insertOne(resultDoc);
-
-    res.status(201).send({
-      message: "Result added successfully",
-      insertedId: result.insertedId,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to add result",
-    });
-  }
-});
-
-app.delete("/results/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    // ---------- Validation ----------
-    if (!id) {
-      return res.status(400).send({
-        message: "Result ID is required",
-      });
-    }
-
-    // ---------- Check if result exists ----------
-    const resultDoc = await resultsCollection.findOne({
-      _id: new ObjectId(id),
-    });
-
-    if (!resultDoc) {
-      return res.status(404).send({
-        message: "Result not found",
-      });
-    }
-
-    // ---------- Delete result ----------
-    const result = await resultsCollection.deleteOne({
-      _id: new ObjectId(id),
-    });
-
-    res.send({
-      message: "Result deleted successfully",
-      deletedCount: result.deletedCount,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: "Failed to delete result",
-    });
-  }
-});
-
-// ==================== EXPENSE MANAGEMENT ROUTES ====================
-
-// CREATE - Add new expense
-app.post("/expenses", ensureDBConnection, async (req, res) => {
-  try {
-    const expense = req.body;
-
-    // Validate required fields
-    if (!expense.category || !expense.amount || !expense.date) {
-      return res.status(400).json({
-        success: false,
-        message: "Category, amount, and date are required",
-      });
-    }
-
-    // Create expense document with proper structure
-    const newExpense = {
-      category: expense.category, // e.g., "Salary", "Utilities", "Supplies", "Maintenance", "Marketing", "Other"
-      amount: parseFloat(expense.amount),
-      date: new Date(expense.date),
-      description: expense.description || "",
-      paymentMethod: expense.paymentMethod || "cash", // cash, bank, card, online
-      paidTo: expense.paidTo || "", // Person/Company name
-      receiptNumber: expense.receiptNumber || "",
-      notes: expense.notes || "",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await expensesCollection.insertOne(newExpense);
-
-    res.status(201).json({
-      success: true,
-      message: "Expense added successfully",
-      expenseId: result.insertedId,
-    });
-  } catch (error) {
-    console.error("Error adding expense:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to add expense",
-      error: error.message,
-    });
-  }
-});
-
-// READ - Get all expenses with optional filters
-app.get("/expenses", ensureDBConnection, async (req, res) => {
-  try {
-    const { category, startDate, endDate, paymentMethod } = req.query;
-    const filter = {};
-
-    // Filter by category
-    if (category) {
-      filter.category = category;
-    }
-
-    // Filter by payment method
-    if (paymentMethod) {
-      filter.paymentMethod = paymentMethod;
-    }
-
-    // Filter by date range
-    if (startDate || endDate) {
-      filter.date = {};
-      if (startDate) {
-        filter.date.$gte = new Date(startDate);
+      if (!batch) {
+        return res.status(404).json({
+          success: false,
+          message: "Batch not found",
+        });
       }
-      if (endDate) {
-        filter.date.$lte = new Date(endDate);
+
+      const updates = { ...req.body };
+      delete updates._id;
+      delete updates.organizationId;
+      delete updates.createdBy;
+      delete updates.createdAt;
+
+      updates.updatedBy = req.userId;
+      updates.updatedAt = new Date();
+
+      const result = await batchesCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updates }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "update",
+        "batch",
+        id,
+        updates
+      );
+
+      res.json({
+        success: true,
+        message: "Batch updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update batch",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Delete batch (organization-scoped)
+app.delete(
+  "/batches/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("delete_batch"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid batch ID",
+        });
       }
+
+      // Check if batch belongs to organization
+      const batch = await batchesCollection.findOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
+      });
+
+      if (!batch) {
+        return res.status(404).json({
+          success: false,
+          message: "Batch not found",
+        });
+      }
+
+      // Soft delete
+      await batchesCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status: "deleted",
+            deletedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Update organization batch count
+      await organizationsCollection.updateOne(
+        { _id: req.organizationId },
+        { $inc: { "usage.currentBatches": -1 } }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "delete",
+        "batch",
+        id
+      );
+
+      res.json({
+        success: true,
+        message: "Batch deleted successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete batch",
+        error: error.message,
+      });
     }
-
-    const expenses = await expensesCollection
-      .find(filter)
-      .sort({ date: -1 })
-      .toArray();
-
-    res.json({
-      success: true,
-      count: expenses.length,
-      data: expenses,
-    });
-  } catch (error) {
-    console.error("Error fetching expenses:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch expenses",
-      error: error.message,
-    });
   }
-});
+);
 
-// READ - Get single expense by ID
-app.get("/expenses/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
+// ==================== ADMISSIONS API (UPDATED) ====================
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
+// Get all admissions (organization-scoped)
+app.get(
+  "/admissions",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("view_students"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 10 } = req.query;
+
+      const admissions = await admissionsCollection
+        .find({
+          organizationId: req.organizationId,
+          status: { $ne: "deleted" },
+        })
+        .skip((page - 1) * limit)
+        .limit(Number(limit))
+        .toArray();
+
+      const total = await admissionsCollection.countDocuments({
+        organizationId: req.organizationId,
+        status: { $ne: "deleted" },
+      });
+
+      res.json({
+        success: true,
+        data: admissions,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
         success: false,
-        message: "Invalid expense ID",
+        message: "Failed to fetch admissions",
+        error: error.message,
       });
     }
-
-    const expense = await expensesCollection.findOne({ _id: new ObjectId(id) });
-
-    if (!expense) {
-      return res.status(404).json({
-        success: false,
-        message: "Expense not found",
-      });
-    }
-
-    res.json({
-      success: true,
-      data: expense,
-    });
-  } catch (error) {
-    console.error("Error fetching expense:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch expense",
-      error: error.message,
-    });
   }
-});
+);
 
-// UPDATE - Update expense by ID
-app.patch("/expenses/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const updates = req.body;
+// Create admission (organization-scoped)
+app.post(
+  "/admissions",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("create_student"),
+  async (req, res) => {
+    try {
+      const { name, phone, email, interestedBatchId, status } = req.body;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid expense ID",
-      });
-    }
+      // Validation
+      if (!name || !phone || !interestedBatchId) {
+        return res.status(400).json({
+          success: false,
+          message: "Name, phone, and interested batch are required",
+        });
+      }
 
-    // Prepare update document
-    const updateDoc = {
-      $set: {
-        ...updates,
+      const newAdmission = {
+        organizationId: req.organizationId,
+        name,
+        phone,
+        email: email || "",
+        interestedBatchId: ObjectId.isValid(interestedBatchId)
+          ? new ObjectId(interestedBatchId)
+          : interestedBatchId,
+        status: status || "inquiry",
+        followUps: [],
+        createdBy: req.userId,
+        createdAt: new Date(),
         updatedAt: new Date(),
-      },
-    };
+      };
 
-    // Convert amount to number if provided
-    if (updates.amount) {
-      updateDoc.$set.amount = parseFloat(updates.amount);
-    }
+      const result = await admissionsCollection.insertOne(newAdmission);
 
-    // Convert date to Date object if provided
-    if (updates.date) {
-      updateDoc.$set.date = new Date(updates.date);
-    }
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "create",
+        "admission",
+        result.insertedId.toString()
+      );
 
-    const result = await expensesCollection.updateOne(
-      { _id: new ObjectId(id) },
-      updateDoc
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({
+      res.status(201).json({
+        success: true,
+        message: "Admission created successfully",
+        data: {
+          insertedId: result.insertedId,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
         success: false,
-        message: "Expense not found",
+        message: "Failed to create admission",
+        error: error.message,
       });
     }
-
-    res.json({
-      success: true,
-      message: "Expense updated successfully",
-    });
-  } catch (error) {
-    console.error("Error updating expense:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to update expense",
-      error: error.message,
-    });
   }
-});
+);
 
-// DELETE - Delete expense by ID
-app.delete("/expenses/:id", ensureDBConnection, async (req, res) => {
-  try {
-    const { id } = req.params;
+// Delete admission (organization-scoped)
+app.delete(
+  "/admissions/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("delete_student"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid expense ID",
-      });
-    }
-
-    const result = await expensesCollection.deleteOne({
-      _id: new ObjectId(id),
-    });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Expense not found",
-      });
-    }
-
-    res.json({
-      success: true,
-      message: "Expense deleted successfully",
-    });
-  } catch (error) {
-    console.error("Error deleting expense:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to delete expense",
-      error: error.message,
-    });
-  }
-});
-
-// ANALYTICS - Get expense statistics
-app.get("/expenses/analytics/summary", ensureDBConnection, async (req, res) => {
-  try {
-    const { startDate, endDate } = req.query;
-    const matchFilter = {};
-
-    // Filter by date range if provided
-    if (startDate || endDate) {
-      matchFilter.date = {};
-      if (startDate) {
-        matchFilter.date.$gte = new Date(startDate);
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid admission ID",
+        });
       }
-      if (endDate) {
-        matchFilter.date.$lte = new Date(endDate);
+
+      // Check if admission belongs to organization
+      const admission = await admissionsCollection.findOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
+      });
+
+      if (!admission) {
+        return res.status(404).json({
+          success: false,
+          message: "Admission not found",
+        });
       }
+
+      // Soft delete
+      await admissionsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status: "deleted",
+            deletedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "delete",
+        "admission",
+        id
+      );
+
+      res.json({
+        success: true,
+        message: "Admission deleted successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete admission",
+        error: error.message,
+      });
     }
-
-    // Aggregate expenses by category
-    const categoryStats = await expensesCollection
-      .aggregate([
-        { $match: matchFilter },
-        {
-          $group: {
-            _id: "$category",
-            totalAmount: { $sum: "$amount" },
-            count: { $sum: 1 },
-          },
-        },
-        { $sort: { totalAmount: -1 } },
-      ])
-      .toArray();
-
-    // Get total expenses
-    const totalExpenses = await expensesCollection
-      .aggregate([
-        { $match: matchFilter },
-        {
-          $group: {
-            _id: null,
-            total: { $sum: "$amount" },
-            count: { $sum: 1 },
-          },
-        },
-      ])
-      .toArray();
-
-    // Get expenses by payment method
-    const paymentMethodStats = await expensesCollection
-      .aggregate([
-        { $match: matchFilter },
-        {
-          $group: {
-            _id: "$paymentMethod",
-            totalAmount: { $sum: "$amount" },
-            count: { $sum: 1 },
-          },
-        },
-      ])
-      .toArray();
-
-    res.json({
-      success: true,
-      data: {
-        totalExpenses: totalExpenses[0]?.total || 0,
-        totalCount: totalExpenses[0]?.count || 0,
-        byCategory: categoryStats,
-        byPaymentMethod: paymentMethodStats,
-      },
-    });
-  } catch (error) {
-    console.error("Error fetching expense analytics:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch expense analytics",
-      error: error.message,
-    });
   }
-});
+);
 
-// Get distinct expense categories
-app.get("/expenses/categories/list", ensureDBConnection, async (req, res) => {
-  try {
-    const categories = await expensesCollection.distinct("category");
+// Update admission (organization-scoped)
+app.patch(
+  "/admissions/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("update_student"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { followUpNote, followUpDate, followUps, status } = req.body;
 
-    res.json({
-      success: true,
-      data: categories,
-    });
-  } catch (error) {
-    console.error("Error fetching categories:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch categories",
-      error: error.message,
-    });
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid admission ID",
+        });
+      }
+
+      // Check if admission belongs to organization
+      const admission = await admissionsCollection.findOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
+      });
+
+      if (!admission) {
+        return res.status(404).json({
+          success: false,
+          message: "Admission not found",
+        });
+      }
+
+      let updateOperation = {};
+      const updates = { updatedAt: new Date(), updatedBy: req.userId };
+
+      // Scenario 1: Add Follow-up
+      if (followUpNote) {
+        // Auto-update status to 'follow-up' if it's currently 'inquiry'
+        if (admission.status === "inquiry") {
+          updates.status = "follow-up";
+        }
+
+        updateOperation = {
+          $set: updates,
+          $push: {
+            followUps: {
+              note: followUpNote,
+              date: followUpDate ? new Date(followUpDate) : new Date(),
+              addedBy: req.userId,
+              addedAt: new Date(),
+            },
+          },
+        };
+      }
+      // Scenario 2: Update Follow-ups (e.g., delete)
+      else if (followUps) {
+        updates.followUps = followUps;
+        updateOperation = { $set: updates };
+      }
+      // Scenario 3: Update Status
+      else if (status) {
+        updates.status = status;
+        updateOperation = { $set: updates };
+      } else {
+        // Fallback for other updates
+        Object.assign(updates, req.body);
+        delete updates._id;
+        delete updates.organizationId;
+        delete updates.createdAt;
+        delete updates.createdBy;
+        updateOperation = { $set: updates };
+      }
+
+      await admissionsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        updateOperation
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "update",
+        "admission",
+        id,
+        req.body
+      );
+
+      res.json({
+        success: true,
+        message: "Admission updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update admission",
+        error: error.message,
+      });
+    }
   }
-});
+);
 
-// Root endpoint
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    message: "Rootx Coaching Management System API",
-    version: "1.0.0",
-    status: "Running",
-  });
-});
+// ==================== FEES API (UPDATED) ====================
 
-// Health check endpoint
-app.get("/health", (req, res) => {
-  res.json({
-    success: true,
-    message: "Server is healthy",
-    timestamp: new Date().toISOString(),
-  });
-});
+// Get all fees (organization-scoped)
+app.get(
+  "/fees",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("view_fees"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 10 } = req.query;
+
+      const fees = await feesCollection
+        .find({ organizationId: req.organizationId })
+        .skip((page - 1) * limit)
+        .limit(Number(limit))
+        .toArray();
+
+      const total = await feesCollection.countDocuments({
+        organizationId: req.organizationId,
+      });
+
+      res.json({
+        success: true,
+        data: fees,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch fees",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== ATTENDANCE API (UPDATED) ====================
+
+// Get all attendances (organization-scoped)
+app.get(
+  "/attendences",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("view_attendance"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 10, batchId, date } = req.query;
+
+      const query = { organizationId: req.organizationId };
+      if (batchId) query.batchId = batchId;
+      if (date) query.date = date; // Expecting string format matching frontend
+
+      const attendances = await attendencesCollection
+        .find(query)
+        .sort({ date: -1 })
+        .skip((Number(page) - 1) * Number(limit))
+        .limit(Number(limit))
+        .toArray();
+
+      const total = await attendencesCollection.countDocuments(query);
+
+      res.json({
+        success: true,
+        data: attendances,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          pages: Math.ceil(total / Number(limit)),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch attendances",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Create or update attendance (organization-scoped)
+app.post(
+  "/attendences",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("manage_attendance"),
+  async (req, res) => {
+    try {
+      const { date, batchId, records, takenBy } = req.body;
+      
+      if (!date || !batchId || !records) {
+        return res.status(400).json({
+          success: false,
+          message: "Date, batchId, and records are required",
+        });
+      }
+
+      const attendanceData = {
+        date,
+        batchId,
+        records,
+        takenBy,
+        organizationId: req.organizationId,
+        updatedAt: new Date(),
+      };
+
+      // Upsert attendance for this batch and date
+      const result = await attendencesCollection.updateOne(
+        { date, batchId, organizationId: req.organizationId },
+        { 
+          $set: attendanceData,
+          $setOnInsert: { createdAt: new Date() }
+        },
+        { upsert: true }
+      );
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        result.upsertedCount > 0 ? "create" : "update",
+        "attendance",
+        (result.upsertedId || result.upsertedId?.toString()) || "existing",
+        attendanceData
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Attendance recorded successfully",
+        data: attendanceData,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to record attendance",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== EXAMS API (UPDATED) ====================
+
+// Get all exams (organization-scoped)
+app.get(
+  "/exams",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("view_exams"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 10, batchId, name } = req.query;
+      
+      const query = { organizationId: req.organizationId };
+      if (batchId) query.batchId = batchId;
+      if (name) query.name = { $regex: name, $options: "i" };
+
+      const exams = await examsCollection
+        .find(query)
+        .sort({ date: -1 })
+        .skip((Number(page) - 1) * Number(limit))
+        .limit(Number(limit))
+        .toArray();
+
+      const total = await examsCollection.countDocuments(query);
+
+      res.json({
+        success: true,
+        data: exams,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          pages: Math.ceil(total / Number(limit)),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch exams",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Create exam (organization-scoped)
+app.post(
+  "/exams",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("manage_exams"),
+  async (req, res) => {
+    try {
+      const exam = req.body;
+      exam.organizationId = req.organizationId;
+      exam.createdBy = req.userId;
+      exam.createdAt = new Date();
+      exam.updatedAt = new Date();
+      
+      if (exam.totalMarks) exam.totalMarks = Number(exam.totalMarks);
+      if (exam.date) exam.date = new Date(exam.date);
+
+      const result = await examsCollection.insertOne(exam);
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "create",
+        "exam",
+        result.insertedId.toString(),
+        exam
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Exam created successfully",
+        data: { ...exam, _id: result.insertedId },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to create exam",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Update exam (organization-scoped)
+app.patch(
+  "/exams/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("manage_exams"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const updates = req.body;
+
+      if (updates.totalMarks) updates.totalMarks = Number(updates.totalMarks);
+      if (updates.date) updates.date = new Date(updates.date);
+      updates.updatedAt = new Date();
+
+      const result = await examsCollection.updateOne(
+        { _id: new ObjectId(id), organizationId: req.organizationId },
+        { $set: updates }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Exam not found",
+        });
+      }
+
+      // Log activity
+      await logActivity(req.userId, req.organizationId, "update", "exam", id, updates);
+
+      res.json({
+        success: true,
+        message: "Exam updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update exam",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Delete exam (organization-scoped)
+// Supports both /exams/:id and /exams?id=... (as used by frontend)
+app.delete(
+  "/exams",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("manage_exams"),
+  async (req, res) => {
+    try {
+      const id = req.query.id;
+      if (!id) {
+        return res.status(400).json({ success: false, message: "Exam ID is required" });
+      }
+
+      // Check if results exist for this exam
+      const resultsCount = await resultsCollection.countDocuments({
+        examId: id,
+        organizationId: req.organizationId,
+      });
+
+      if (resultsCount > 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Cannot delete exam because results already exist for it.",
+        });
+      }
+
+      const result = await examsCollection.deleteOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
+      });
+
+      if (result.deletedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Exam not found",
+        });
+      }
+
+      // Log activity
+      await logActivity(req.userId, req.organizationId, "delete", "exam", id);
+
+      res.json({
+        success: true,
+        message: "Exam deleted successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete exam",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== RESULTS API (UPDATED) ====================
+
+// Get all results (organization-scoped)
+app.get(
+  "/results",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("view_exams"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 10, examId, studentId } = req.query;
+
+      const query = { organizationId: req.organizationId };
+      if (examId) query.examId = examId;
+      if (studentId) query.studentId = studentId;
+
+      const results = await resultsCollection
+        .find(query)
+        .skip((Number(page) - 1) * Number(limit))
+        .limit(Number(limit))
+        .toArray();
+
+      const total = await resultsCollection.countDocuments(query);
+
+      res.json({
+        success: true,
+        data: results,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          pages: Math.ceil(total / Number(limit)),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch results",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Create result (organization-scoped)
+app.post(
+  "/results",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  requirePermission("manage_exams"),
+  async (req, res) => {
+    try {
+      const resultData = req.body;
+      resultData.organizationId = req.organizationId;
+      resultData.createdBy = req.userId;
+      resultData.createdAt = new Date();
+      resultData.updatedAt = new Date();
+
+      if (resultData.marks) resultData.marks = Number(resultData.marks);
+
+      // Check for existing result for this student and exam
+      const existing = await resultsCollection.findOne({
+        examId: resultData.examId,
+        studentId: resultData.studentId,
+        organizationId: req.organizationId,
+      });
+
+      if (existing) {
+        return res.status(400).json({
+          success: false,
+          message: "Result already exists for this student and exam",
+        });
+      }
+
+      const result = await resultsCollection.insertOne(resultData);
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "create",
+        "result",
+        result.insertedId.toString(),
+        resultData
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Result created successfully",
+        data: { ...resultData, _id: result.insertedId },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to create result",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== EXPENSES API (UPDATED) ====================
+
+// Get all expenses (organization-scoped)
+app.get(
+  "/expenses",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 10 } = req.query;
+
+      const expenses = await expensesCollection
+        .find({ organizationId: req.organizationId })
+        .sort({ date: -1 })
+        .skip((Number(page) - 1) * Number(limit))
+        .limit(Number(limit))
+        .toArray();
+
+      const total = await expensesCollection.countDocuments({
+        organizationId: req.organizationId,
+      });
+
+      res.json({
+        success: true,
+        data: expenses,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          pages: Math.ceil(total / Number(limit)),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch expenses",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Create expense (organization-scoped)
+app.post(
+  "/expenses",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  async (req, res) => {
+    try {
+      const expense = req.body;
+      expense.organizationId = req.organizationId;
+      expense.createdBy = req.userId;
+      expense.createdAt = new Date();
+      expense.updatedAt = new Date();
+      
+      // Ensure amount is a number
+      if (expense.amount) expense.amount = Number(expense.amount);
+      if (expense.date) expense.date = new Date(expense.date);
+
+      const result = await expensesCollection.insertOne(expense);
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "create",
+        "expense",
+        result.insertedId.toString(),
+        expense
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Expense created successfully",
+        data: { ...expense, _id: result.insertedId },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to create expense",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Update expense (organization-scoped)
+app.patch(
+  "/expenses/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const updates = req.body;
+
+      // Ensure amount is a number if being updated
+      if (updates.amount) updates.amount = Number(updates.amount);
+      if (updates.date) updates.date = new Date(updates.date);
+      
+      updates.updatedAt = new Date();
+
+      const result = await expensesCollection.updateOne(
+        { _id: new ObjectId(id), organizationId: req.organizationId },
+        { $set: updates }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Expense not found",
+        });
+      }
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "update",
+        "expense",
+        id,
+        updates
+      );
+
+      res.json({
+        success: true,
+        message: "Expense updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update expense",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Delete expense (organization-scoped)
+app.delete(
+  "/expenses/:id",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const result = await expensesCollection.deleteOne({
+        _id: new ObjectId(id),
+        organizationId: req.organizationId,
+      });
+
+      if (result.deletedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Expense not found",
+        });
+      }
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "delete",
+        "expense",
+        id
+      );
+
+      res.json({
+        success: true,
+        message: "Expense deleted successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete expense",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SERVER START ====================
 
 // Start server only in non-Vercel environment
 if (process.env.NODE_ENV !== "production") {
