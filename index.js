@@ -483,42 +483,65 @@ app.post("/organizations", ensureDBConnection, async (req, res) => {
     const orgResult = await organizationsCollection.insertOne(organization);
     const organizationId = orgResult.insertedId;
 
-    // Create owner user
-    const owner = {
-      name: ownerName || "Owner",
-      email: ownerEmail,
-      phone: phone || "",
-      password: ownerPassword || "", // Should be hashed (kept for backward compatibility)
-      image: ownerPhotoURL || "",
-      photoURL: ownerPhotoURL || "",
-      firebaseUid: ownerFirebaseUid || "",
-      organizationId,
-      role: "org_owner",
-      permissions: ["all"],
-      isSuperAdmin: false,
-      status: "active",
-      emailVerified: false,
-      lastLogin: null,
-      lastActivity: new Date(),
-      preferences: {
-        language: "en",
-        theme: "light",
-        notifications: {
-          email: true,
-          sms: false,
-          push: true,
-        },
-      },
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
+    // Check if owner user already exists (they might have registered via /register)
+    let existingUser = await usersCollection.findOne({ email: ownerEmail });
+    let ownerId;
 
-    const userResult = await usersCollection.insertOne(owner);
+    if (existingUser) {
+      // User exists - update their record to make them owner of this organization
+      await usersCollection.updateOne(
+        { _id: existingUser._id },
+        {
+          $set: {
+            organizationId,
+            role: "org_owner",
+            permissions: ["all"],
+            photoURL: ownerPhotoURL || existingUser.photoURL || "",
+            firebaseUid: ownerFirebaseUid || existingUser.firebaseUid || "",
+            status: "active",
+            updatedAt: new Date(),
+          },
+        }
+      );
+      ownerId = existingUser._id;
+    } else {
+      // Create new owner user
+      const owner = {
+        name: ownerName || "Owner",
+        email: ownerEmail,
+        phone: phone || "",
+        password: ownerPassword || "", // Should be hashed (kept for backward compatibility)
+        photoURL: ownerPhotoURL || "",
+        firebaseUid: ownerFirebaseUid || "",
+        organizationId,
+        role: "org_owner",
+        permissions: ["all"],
+        isSuperAdmin: false,
+        status: "active",
+        emailVerified: false,
+        lastLogin: null,
+        lastActivity: new Date(),
+        preferences: {
+          language: "en",
+          theme: "light",
+          notifications: {
+            email: true,
+            sms: false,
+            push: true,
+          },
+        },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const userResult = await usersCollection.insertOne(owner);
+      ownerId = userResult.insertedId;
+    }
 
     // Update organization with ownerId
     await organizationsCollection.updateOne(
       { _id: organizationId },
-      { $set: { ownerId: userResult.insertedId } }
+      { $set: { ownerId: ownerId } }
     );
 
     // Create trial subscription
@@ -548,7 +571,7 @@ app.post("/organizations", ensureDBConnection, async (req, res) => {
       data: {
         organizationId,
         slug,
-        ownerId: userResult.insertedId,
+        ownerId: ownerId,
       },
     });
   } catch (error) {
@@ -830,6 +853,190 @@ app.get(
   }
 );
 
+// Get subscription by organizationId
+app.get(
+  "/subscriptions/organization/:organizationId",
+  ensureDBConnection,
+  authenticateUser,
+  async (req, res) => {
+    try {
+      const { organizationId } = req.params;
+
+      // Check permission
+      if (
+        req.userRole !== "super_admin" &&
+        req.organizationId.toString() !== organizationId
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied",
+        });
+      }
+
+      const subscription = await subscriptionsCollection.findOne({
+        organizationId: new ObjectId(organizationId),
+      });
+
+      if (!subscription) {
+        return res.status(404).json({
+          success: false,
+          message: "Subscription not found",
+          data: null,
+        });
+      }
+
+      res.json({
+        success: true,
+        data: subscription,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch subscription",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get billing history for an organization
+app.get(
+  "/subscriptions/payments",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  async (req, res) => {
+    try {
+      const payments = await paymentsCollection
+        .find({
+          organizationId: req.organizationId,
+          type: "subscription",
+        })
+        .sort({ date: -1 })
+        .toArray();
+
+      res.json({
+        success: true,
+        data: payments,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch billing history",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Upgrade/Change subscription plan
+app.post(
+  "/subscriptions/upgrade",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  async (req, res) => {
+    try {
+      const { planId, billingCycle } = req.body;
+
+      if (!planId) {
+        return res.status(400).json({
+          success: false,
+          message: "Plan selection is required",
+        });
+      }
+
+      // Find the new plan
+      const plan = await subscriptionPlansCollection.findOne({
+        _id: new ObjectId(planId),
+      });
+
+      if (!plan) {
+        return res.status(404).json({
+          success: false,
+          message: "Plan not found",
+        });
+      }
+
+      const amount = billingCycle === "yearly" ? plan.yearlyPrice : plan.monthlyPrice;
+      const nextBillingDate = new Date();
+      if (billingCycle === "yearly") {
+        nextBillingDate.setFullYear(nextBillingDate.getFullYear() + 1);
+      } else {
+        nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+      }
+
+      // Update or create subscription
+      const subscriptionData = {
+        organizationId: req.organizationId,
+        planId: plan._id,
+        tier: plan.tier,
+        status: "active",
+        billingCycle: billingCycle || "monthly",
+        amount,
+        nextBillingDate,
+        updatedAt: new Date(),
+      };
+
+      await subscriptionsCollection.updateOne(
+        { organizationId: req.organizationId },
+        { $set: subscriptionData },
+        { upsert: true }
+      );
+
+      // Update organization limits
+      await organizationsCollection.updateOne(
+        { _id: req.organizationId },
+        {
+          $set: {
+            subscriptionStatus: "active",
+            limits: plan.limits,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Record payment
+      const paymentRecord = {
+        organizationId: req.organizationId,
+        type: "subscription",
+        planTier: plan.tier,
+        amount,
+        billingCycle: billingCycle || "monthly",
+        method: "online_payment",
+        status: "paid",
+        date: new Date(),
+        invoiceNumber: `INV-${Date.now().toString().slice(-6)}`,
+        createdBy: req.userId,
+      };
+
+      await paymentsCollection.insertOne(paymentRecord);
+
+      // Log activity
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "upgrade",
+        "subscription",
+        plan.tier
+      );
+
+      res.json({
+        success: true,
+        message: `Plan upgraded to ${plan.name} successfully`,
+        data: subscriptionData,
+      });
+    } catch (error) {
+      console.error("Upgrade error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to upgrade plan",
+        error: error.message,
+      });
+    }
+  }
+);
+
 // ==================== USERS API (UPDATED) ====================
 
 // Register/Create user (Public endpoint - no auth required)
@@ -901,9 +1108,15 @@ app.get(
       const user = { ...req.user };
       delete user.password; // Remove password field for security
 
+      // Add organization status flag
+      const hasOrganization = user.organizationId ? true : false;
+
       res.json({
         success: true,
-        data: user,
+        data: {
+          ...user,
+          hasOrganization,
+        },
       });
     } catch (error) {
       res.status(500).json({
@@ -931,7 +1144,7 @@ app.get(
           organizationId: req.organizationId,
           status: { $ne: "deleted" },
         })
-        .select("-password") // Exclude password
+        .project({ password: 0 }) // Exclude password field
         .skip((page - 1) * limit)
         .limit(Number(limit))
         .toArray();
@@ -970,26 +1183,38 @@ app.post(
   requirePermission("manage_users"),
   async (req, res) => {
     try {
-      const { name, email, role, phone } = req.body;
+      const { email, role } = req.body;
 
       // Validation
-      if (!name || !email || !role) {
+      if (!email || !role) {
         return res.status(400).json({
           success: false,
-          message: "Name, email, and role are required",
+          message: "Email and role are required",
         });
       }
 
-      // Check if user already exists
-      const existing = await usersCollection.findOne({ email });
-      if (existing) {
+      // Check if user exists
+      const existingUser = await usersCollection.findOne({ email });
+
+      if (!existingUser) {
+        return res.status(404).json({
+          success: false,
+          message: "User must register first at /register",
+        });
+      }
+
+      // Check if user already belongs to an organization
+      if (existingUser.organizationId) {
+        const isSameOrg = existingUser.organizationId.equals(req.organizationId);
         return res.status(409).json({
           success: false,
-          message: "User with this email already exists",
+          message: isSameOrg
+            ? "User is already a member of your organization"
+            : "User already belongs to another organization",
         });
       }
 
-      // Check staff limit
+      // Check staff limit before assigning
       const org = await organizationsCollection.findOne({
         _id: req.organizationId,
       });
@@ -1001,36 +1226,17 @@ app.post(
         });
       }
 
-      // Create user
-      const user = {
-        name,
-        email,
-        phone: phone || "",
-        password: "", // Will be set during first login
-        image: "",
-        firebaseUid: "",
-        organizationId: req.organizationId,
-        role,
-        permissions: [],
-        isSuperAdmin: false,
-        status: "active",
-        emailVerified: false,
-        lastLogin: null,
-        lastActivity: new Date(),
-        preferences: {
-          language: "en",
-          theme: "light",
-          notifications: {
-            email: true,
-            sms: false,
-            push: true,
+      // Assign user to organization
+      await usersCollection.updateOne(
+        { _id: existingUser._id },
+        {
+          $set: {
+            organizationId: req.organizationId,
+            role: role,
+            updatedAt: new Date(),
           },
-        },
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const result = await usersCollection.insertOne(user);
+        }
+      );
 
       // Update organization staff count
       await organizationsCollection.updateOne(
@@ -1042,18 +1248,17 @@ app.post(
       await logActivity(
         req.userId,
         req.organizationId,
-        "create",
+        "assign",
         "user",
-        result.insertedId.toString()
+        existingUser._id.toString()
       );
 
-      // TODO: Send invitation email
-
-      res.status(201).json({
+      res.status(200).json({
         success: true,
-        message: "User invited successfully",
+        message: "User added to organization successfully",
         data: {
-          userId: result.insertedId,
+          userId: existingUser._id,
+          wasExisting: true,
         },
       });
     } catch (error) {
