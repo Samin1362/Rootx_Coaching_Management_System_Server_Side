@@ -44,6 +44,7 @@ let subscriptionPlansCollection;
 let paymentsCollection;
 let activityLogsCollection;
 let notificationsCollection;
+let platformSettingsCollection;
 
 // EXISTING COLLECTIONS (Updated for multi-tenancy)
 let usersCollection;
@@ -75,6 +76,7 @@ async function connectDB() {
     paymentsCollection = db.collection("payments");
     activityLogsCollection = db.collection("activity_logs");
     notificationsCollection = db.collection("notifications");
+    platformSettingsCollection = db.collection("platform_settings");
 
     // Initialize EXISTING collections
     usersCollection = db.collection("users");
@@ -191,6 +193,18 @@ async function createIndexes() {
     // Notifications indexes
     await notificationsCollection.createIndex({ userId: 1, isRead: 1 });
     await notificationsCollection.createIndex({ organizationId: 1, createdAt: -1 });
+
+    // Platform Settings indexes (Super Admin)
+    await platformSettingsCollection.createIndex({ key: 1 }, { unique: true });
+    await platformSettingsCollection.createIndex({ category: 1 });
+
+    // Additional Super Admin indexes
+    await organizationsCollection.createIndex({ createdAt: -1 });
+    await organizationsCollection.createIndex({ status: 1 });
+    await usersCollection.createIndex({ isSuperAdmin: 1 });
+    await activityLogsCollection.createIndex({ createdAt: -1 });
+    await activityLogsCollection.createIndex({ action: 1 });
+    await paymentsCollection.createIndex({ paymentDate: -1 });
 
     console.log("✅ Indexes created successfully");
   } catch (error) {
@@ -341,7 +355,8 @@ const requirePermission = (permission) => {
 // Organization isolation middleware
 const enforceOrganizationIsolation = (req, res, next) => {
   // Skip for super_admin
-  if (req.userRole === "super_admin") {
+  if (req.userRole === "super_admin" || req.user?.isSuperAdmin) {
+    req.isSuperAdmin = true;
     return next();
   }
 
@@ -355,6 +370,50 @@ const enforceOrganizationIsolation = (req, res, next) => {
 
   next();
 };
+
+// Super Admin verification middleware
+const requireSuperAdmin = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required",
+    });
+  }
+
+  if (req.user.role !== "super_admin" && !req.user.isSuperAdmin) {
+    return res.status(403).json({
+      success: false,
+      message: "Super admin access required",
+    });
+  }
+
+  // Super admins bypass organization isolation
+  req.isSuperAdmin = true;
+  next();
+};
+
+// Log activity for super admin actions
+async function logSuperAdminActivity(userId, action, resource, resourceId, targetOrgId = null, changes = null, req = null) {
+  try {
+    const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+
+    await activityLogsCollection.insertOne({
+      organizationId: targetOrgId ? new ObjectId(targetOrgId) : null,
+      userId: new ObjectId(userId),
+      userName: user?.name || "Super Admin",
+      action: `super_admin_${action}`,
+      resource,
+      resourceId,
+      changes,
+      ipAddress: req?.ip || req?.headers?.['x-forwarded-for'] || null,
+      userAgent: req?.headers?.['user-agent'] || null,
+      isSuperAdminAction: true,
+      createdAt: new Date(),
+    });
+  } catch (error) {
+    console.error("Error logging super admin activity:", error);
+  }
+}
 
 // Log activity
 async function logActivity(userId, organizationId, action, resource, resourceId, changes = null) {
@@ -3166,6 +3225,3684 @@ app.delete(
       res.status(500).json({
         success: false,
         message: "Failed to delete expense",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SUPER ADMIN API ROUTES ====================
+
+// ==================== SUPER ADMIN: DASHBOARD ====================
+
+// Get platform statistics
+app.get(
+  "/super-admin/dashboard/stats",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { period = "30days" } = req.query;
+
+      // Calculate date range
+      let startDate = new Date();
+      switch (period) {
+        case "7days":
+          startDate.setDate(startDate.getDate() - 7);
+          break;
+        case "30days":
+          startDate.setDate(startDate.getDate() - 30);
+          break;
+        case "90days":
+          startDate.setDate(startDate.getDate() - 90);
+          break;
+        case "12months":
+          startDate.setMonth(startDate.getMonth() - 12);
+          break;
+        default:
+          startDate.setDate(startDate.getDate() - 30);
+      }
+
+      // Organizations stats
+      const totalOrgs = await organizationsCollection.countDocuments({
+        status: { $ne: "deleted" },
+      });
+      const newOrgs = await organizationsCollection.countDocuments({
+        createdAt: { $gte: startDate },
+        status: { $ne: "deleted" },
+      });
+      const activeOrgs = await organizationsCollection.countDocuments({
+        status: "active",
+      });
+      const trialOrgs = await organizationsCollection.countDocuments({
+        subscriptionStatus: "trial",
+      });
+      const suspendedOrgs = await organizationsCollection.countDocuments({
+        status: "suspended",
+      });
+
+      // Users stats
+      const totalUsers = await usersCollection.countDocuments({});
+      const newUsers = await usersCollection.countDocuments({
+        createdAt: { $gte: startDate },
+      });
+      const activeUsers = await usersCollection.countDocuments({
+        status: "active",
+      });
+
+      // Subscriptions stats
+      const subscriptionStats = await subscriptionsCollection
+        .aggregate([
+          {
+            $group: {
+              _id: "$tier",
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray();
+
+      const byTier = {};
+      subscriptionStats.forEach((s) => {
+        byTier[s._id] = s.count;
+      });
+
+      const totalSubs = await subscriptionsCollection.countDocuments({});
+      const activeSubs = await subscriptionsCollection.countDocuments({
+        status: "active",
+      });
+      const trialSubs = await subscriptionsCollection.countDocuments({
+        status: "trial",
+      });
+
+      // Revenue stats (MRR from active monthly subscriptions)
+      const mrrResult = await subscriptionsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "active",
+              billingCycle: "monthly",
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              mrr: { $sum: "$amount" },
+            },
+          },
+        ])
+        .toArray();
+
+      const mrr = mrrResult[0]?.mrr || 0;
+
+      // Total revenue from payments
+      const revenueResult = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "completed",
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              totalRevenue: { $sum: "$amount" },
+            },
+          },
+        ])
+        .toArray();
+
+      const totalRevenue = revenueResult[0]?.totalRevenue || 0;
+
+      // Previous period revenue for growth calculation
+      const prevPeriodStart = new Date(startDate);
+      prevPeriodStart.setTime(prevPeriodStart.getTime() - (new Date() - startDate));
+
+      const prevRevenueResult = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "completed",
+              paymentDate: { $gte: prevPeriodStart, $lt: startDate },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              totalRevenue: { $sum: "$amount" },
+            },
+          },
+        ])
+        .toArray();
+
+      const prevRevenue = prevRevenueResult[0]?.totalRevenue || 0;
+      const growth = prevRevenue > 0 ? ((totalRevenue - prevRevenue) / prevRevenue) * 100 : 0;
+
+      // Students stats
+      const totalStudents = await studentsCollection.countDocuments({
+        status: "active",
+      });
+
+      res.json({
+        success: true,
+        data: {
+          organizations: {
+            total: totalOrgs,
+            new: newOrgs,
+            active: activeOrgs,
+            trial: trialOrgs,
+            suspended: suspendedOrgs,
+          },
+          users: {
+            total: totalUsers,
+            new: newUsers,
+            active: activeUsers,
+          },
+          subscriptions: {
+            total: totalSubs,
+            active: activeSubs,
+            trial: trialSubs,
+            byTier,
+          },
+          revenue: {
+            mrr,
+            totalRevenue,
+            growth: parseFloat(growth.toFixed(2)),
+          },
+          students: {
+            total: totalStudents,
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch dashboard stats",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get revenue trend data
+app.get(
+  "/super-admin/dashboard/revenue-trend",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { period = "6months" } = req.query;
+
+      let months = 6;
+      switch (period) {
+        case "3months":
+          months = 3;
+          break;
+        case "6months":
+          months = 6;
+          break;
+        case "12months":
+          months = 12;
+          break;
+        default:
+          months = 6;
+      }
+
+      const startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - months);
+
+      const revenueTrend = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "completed",
+              paymentDate: { $gte: startDate },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: { format: "%Y-%m", date: "$paymentDate" },
+              },
+              revenue: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+        ])
+        .toArray();
+
+      // Calculate MRR per month from subscriptions
+      const mrrTrend = await subscriptionsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "active",
+              billingCycle: "monthly",
+              createdAt: { $lte: new Date() },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              mrr: { $sum: "$amount" },
+            },
+          },
+        ])
+        .toArray();
+
+      const currentMrr = mrrTrend[0]?.mrr || 0;
+
+      // Format the data
+      const data = revenueTrend.map((item) => ({
+        month: item._id,
+        revenue: item.revenue,
+        mrr: currentMrr, // Simplified: using current MRR for all months
+      }));
+
+      res.json({
+        success: true,
+        data,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch revenue trend",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get recent organizations
+app.get(
+  "/super-admin/dashboard/recent-organizations",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { limit = 5 } = req.query;
+
+      const organizations = await organizationsCollection
+        .aggregate([
+          {
+            $match: {
+              status: { $ne: "deleted" },
+            },
+          },
+          { $sort: { createdAt: -1 } },
+          { $limit: parseInt(limit) },
+          {
+            $lookup: {
+              from: "users",
+              localField: "ownerId",
+              foreignField: "_id",
+              as: "ownerData",
+            },
+          },
+          { $unwind: { path: "$ownerData", preserveNullAndEmptyArrays: true } },
+          {
+            $project: {
+              _id: 1,
+              name: 1,
+              slug: 1,
+              email: 1,
+              subscriptionTier: 1,
+              subscriptionStatus: 1,
+              status: 1,
+              createdAt: 1,
+              owner: {
+                _id: "$ownerData._id",
+                name: "$ownerData.name",
+                email: "$ownerData.email",
+              },
+            },
+          },
+        ])
+        .toArray();
+
+      res.json({
+        success: true,
+        data: organizations,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch recent organizations",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get activity feed
+app.get(
+  "/super-admin/dashboard/activity-feed",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { limit = 10 } = req.query;
+
+      const activities = await activityLogsCollection
+        .aggregate([
+          { $sort: { createdAt: -1 } },
+          { $limit: parseInt(limit) },
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "organizationId",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+          {
+            $project: {
+              _id: 1,
+              userName: 1,
+              organizationName: "$orgData.name",
+              action: 1,
+              resource: 1,
+              resourceId: 1,
+              createdAt: 1,
+            },
+          },
+        ])
+        .toArray();
+
+      res.json({
+        success: true,
+        data: activities,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch activity feed",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SUPER ADMIN: ORGANIZATIONS ====================
+
+// List all organizations
+app.get(
+  "/super-admin/organizations",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const {
+        page = 1,
+        limit = 20,
+        search = "",
+        status = "",
+        tier = "",
+        sortBy = "createdAt",
+        order = "desc",
+      } = req.query;
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      // Build query
+      const query = { status: { $ne: "deleted" } };
+
+      if (search) {
+        query.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { email: { $regex: search, $options: "i" } },
+          { slug: { $regex: search, $options: "i" } },
+        ];
+      }
+
+      if (status) {
+        query.status = status;
+      }
+
+      if (tier) {
+        query.subscriptionTier = tier;
+      }
+
+      // Sort options
+      const sortOptions = {};
+      sortOptions[sortBy] = order === "desc" ? -1 : 1;
+
+      const total = await organizationsCollection.countDocuments(query);
+
+      const organizations = await organizationsCollection
+        .aggregate([
+          { $match: query },
+          { $sort: sortOptions },
+          { $skip: skip },
+          { $limit: parseInt(limit) },
+          {
+            $lookup: {
+              from: "users",
+              localField: "ownerId",
+              foreignField: "_id",
+              as: "ownerData",
+            },
+          },
+          { $unwind: { path: "$ownerData", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "users",
+              localField: "_id",
+              foreignField: "organizationId",
+              as: "orgUsers",
+            },
+          },
+          {
+            $project: {
+              _id: 1,
+              name: 1,
+              slug: 1,
+              logo: 1,
+              email: 1,
+              phone: 1,
+              subscriptionTier: 1,
+              subscriptionStatus: 1,
+              status: 1,
+              usage: 1,
+              limits: 1,
+              createdAt: 1,
+              updatedAt: 1,
+              owner: {
+                _id: "$ownerData._id",
+                name: "$ownerData.name",
+                email: "$ownerData.email",
+              },
+              userCount: { $size: "$orgUsers" },
+            },
+          },
+        ])
+        .toArray();
+
+      res.json({
+        success: true,
+        data: {
+          organizations,
+          pagination: {
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch organizations",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get single organization details
+app.get(
+  "/super-admin/organizations/:orgId",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { orgId } = req.params;
+
+      const organization = await organizationsCollection
+        .aggregate([
+          { $match: { _id: new ObjectId(orgId) } },
+          {
+            $lookup: {
+              from: "users",
+              localField: "ownerId",
+              foreignField: "_id",
+              as: "ownerData",
+            },
+          },
+          { $unwind: { path: "$ownerData", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "subscriptions",
+              localField: "_id",
+              foreignField: "organizationId",
+              as: "subscription",
+            },
+          },
+          { $unwind: { path: "$subscription", preserveNullAndEmptyArrays: true } },
+        ])
+        .toArray();
+
+      if (!organization || organization.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Organization not found",
+        });
+      }
+
+      const org = organization[0];
+      org.owner = {
+        _id: org.ownerData?._id,
+        name: org.ownerData?.name,
+        email: org.ownerData?.email,
+      };
+      delete org.ownerData;
+
+      // Get organization stats
+      const totalUsers = await usersCollection.countDocuments({
+        organizationId: new ObjectId(orgId),
+      });
+
+      const totalStudents = await studentsCollection.countDocuments({
+        organizationId: new ObjectId(orgId),
+      });
+
+      const totalBatches = await batchesCollection.countDocuments({
+        organizationId: new ObjectId(orgId),
+      });
+
+      org.stats = {
+        totalUsers,
+        totalStudents,
+        totalBatches,
+      };
+
+      res.json({
+        success: true,
+        data: org,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch organization",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Create organization (Super Admin)
+app.post(
+  "/super-admin/organizations",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const {
+        name,
+        slug,
+        email,
+        phone,
+        address,
+        ownerId,
+        subscriptionTier = "free",
+        status = "active",
+      } = req.body;
+
+      // Validation
+      if (!name || !slug || !email) {
+        return res.status(400).json({
+          success: false,
+          message: "Name, slug, and email are required",
+        });
+      }
+
+      // Check if slug or email already exists
+      const existing = await organizationsCollection.findOne({
+        $or: [{ slug }, { email }],
+      });
+
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          message: "Organization with this slug or email already exists",
+        });
+      }
+
+      // Get plan limits
+      const plan = await subscriptionPlansCollection.findOne({ tier: subscriptionTier });
+      const limits = plan?.limits || {
+        maxStudents: 50,
+        maxBatches: 3,
+        maxStaff: 2,
+        maxStorage: 100,
+        features: ["students", "batches", "basic_reports"],
+      };
+
+      // Create organization
+      const organization = {
+        name,
+        slug,
+        logo: "",
+        email,
+        phone: phone || "",
+        address: address || {},
+        subscriptionStatus: subscriptionTier === "free" ? "trial" : "active",
+        subscriptionTier,
+        limits,
+        usage: {
+          currentStudents: 0,
+          currentBatches: 0,
+          currentStaff: 0,
+          storageUsed: 0,
+        },
+        settings: {
+          timezone: "Asia/Dhaka",
+          currency: "BDT",
+          language: "en",
+          dateFormat: "DD/MM/YYYY",
+          fiscalYearStart: "01-01",
+        },
+        branding: {
+          primaryColor: "#3B82F6",
+          secondaryColor: "#10B981",
+          customDomain: "",
+        },
+        ownerId: ownerId ? new ObjectId(ownerId) : null,
+        status,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await organizationsCollection.insertOne(organization);
+
+      // Create subscription
+      const subscription = {
+        organizationId: result.insertedId,
+        tier: subscriptionTier,
+        status: subscriptionTier === "free" ? "trial" : "active",
+        billingCycle: "monthly",
+        amount: plan?.monthlyPrice || 0,
+        currency: "BDT",
+        trialStartDate: new Date(),
+        trialEndDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
+        isTrialUsed: true,
+        currentPeriodStart: new Date(),
+        currentPeriodEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        nextBillingDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        cancelAtPeriodEnd: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      await subscriptionsCollection.insertOne(subscription);
+
+      // Update owner's organizationId if provided
+      if (ownerId) {
+        await usersCollection.updateOne(
+          { _id: new ObjectId(ownerId) },
+          {
+            $set: {
+              organizationId: result.insertedId,
+              role: "org_owner",
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "created",
+        "organization",
+        result.insertedId.toString(),
+        result.insertedId.toString(),
+        { name, slug, email, subscriptionTier },
+        req
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Organization created successfully",
+        data: {
+          organizationId: result.insertedId,
+          slug,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to create organization",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Update organization
+app.patch(
+  "/super-admin/organizations/:orgId",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const updates = req.body;
+
+      // Get current organization for logging
+      const currentOrg = await organizationsCollection.findOne({
+        _id: new ObjectId(orgId),
+      });
+
+      if (!currentOrg) {
+        return res.status(404).json({
+          success: false,
+          message: "Organization not found",
+        });
+      }
+
+      // Remove fields that shouldn't be updated directly
+      delete updates._id;
+      delete updates.createdAt;
+
+      updates.updatedAt = new Date();
+
+      await organizationsCollection.updateOne(
+        { _id: new ObjectId(orgId) },
+        { $set: updates }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "updated",
+        "organization",
+        orgId,
+        orgId,
+        { before: currentOrg, after: updates },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Organization updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update organization",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Change organization status
+app.patch(
+  "/super-admin/organizations/:orgId/status",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const { status } = req.body;
+
+      if (!["active", "suspended", "inactive"].includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid status. Must be: active, suspended, or inactive",
+        });
+      }
+
+      const currentOrg = await organizationsCollection.findOne({
+        _id: new ObjectId(orgId),
+      });
+
+      if (!currentOrg) {
+        return res.status(404).json({
+          success: false,
+          message: "Organization not found",
+        });
+      }
+
+      await organizationsCollection.updateOne(
+        { _id: new ObjectId(orgId) },
+        {
+          $set: {
+            status,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "status_changed",
+        "organization",
+        orgId,
+        orgId,
+        { previousStatus: currentOrg.status, newStatus: status },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: `Organization ${status === "suspended" ? "suspended" : status === "active" ? "activated" : "deactivated"} successfully`,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to change organization status",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Override organization limits
+app.patch(
+  "/super-admin/organizations/:orgId/limits",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const { maxStudents, maxBatches, maxStaff, maxStorage, features } = req.body;
+
+      const currentOrg = await organizationsCollection.findOne({
+        _id: new ObjectId(orgId),
+      });
+
+      if (!currentOrg) {
+        return res.status(404).json({
+          success: false,
+          message: "Organization not found",
+        });
+      }
+
+      const newLimits = {
+        maxStudents: maxStudents ?? currentOrg.limits.maxStudents,
+        maxBatches: maxBatches ?? currentOrg.limits.maxBatches,
+        maxStaff: maxStaff ?? currentOrg.limits.maxStaff,
+        maxStorage: maxStorage ?? currentOrg.limits.maxStorage,
+        features: features ?? currentOrg.limits.features,
+      };
+
+      await organizationsCollection.updateOne(
+        { _id: new ObjectId(orgId) },
+        {
+          $set: {
+            limits: newLimits,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "limits_overridden",
+        "organization",
+        orgId,
+        orgId,
+        { previousLimits: currentOrg.limits, newLimits },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Organization limits updated successfully",
+        data: { limits: newLimits },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update organization limits",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Soft delete organization
+app.delete(
+  "/super-admin/organizations/:orgId",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { orgId } = req.params;
+
+      const currentOrg = await organizationsCollection.findOne({
+        _id: new ObjectId(orgId),
+      });
+
+      if (!currentOrg) {
+        return res.status(404).json({
+          success: false,
+          message: "Organization not found",
+        });
+      }
+
+      await organizationsCollection.updateOne(
+        { _id: new ObjectId(orgId) },
+        {
+          $set: {
+            status: "deleted",
+            deletedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "deleted",
+        "organization",
+        orgId,
+        orgId,
+        { name: currentOrg.name, slug: currentOrg.slug },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Organization deleted successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete organization",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get organization usage statistics
+app.get(
+  "/super-admin/organizations/:orgId/usage",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const orgObjectId = new ObjectId(orgId);
+
+      const org = await organizationsCollection.findOne({ _id: orgObjectId });
+
+      if (!org) {
+        return res.status(404).json({
+          success: false,
+          message: "Organization not found",
+        });
+      }
+
+      // Get actual counts
+      const studentsCount = await studentsCollection.countDocuments({
+        organizationId: orgObjectId,
+        status: "active",
+      });
+
+      const batchesCount = await batchesCollection.countDocuments({
+        organizationId: orgObjectId,
+        status: "active",
+      });
+
+      const staffCount = await usersCollection.countDocuments({
+        organizationId: orgObjectId,
+        status: "active",
+      });
+
+      const limits = org.limits || {};
+
+      res.json({
+        success: true,
+        data: {
+          students: {
+            current: studentsCount,
+            max: limits.maxStudents || 50,
+            percentage: limits.maxStudents
+              ? parseFloat(((studentsCount / limits.maxStudents) * 100).toFixed(1))
+              : 0,
+          },
+          batches: {
+            current: batchesCount,
+            max: limits.maxBatches || 3,
+            percentage: limits.maxBatches
+              ? parseFloat(((batchesCount / limits.maxBatches) * 100).toFixed(1))
+              : 0,
+          },
+          staff: {
+            current: staffCount,
+            max: limits.maxStaff || 2,
+            percentage: limits.maxStaff
+              ? parseFloat(((staffCount / limits.maxStaff) * 100).toFixed(1))
+              : 0,
+          },
+          storage: {
+            current: org.usage?.storageUsed || 0,
+            max: limits.maxStorage || 100,
+            unit: "MB",
+            percentage: limits.maxStorage
+              ? parseFloat((((org.usage?.storageUsed || 0) / limits.maxStorage) * 100).toFixed(1))
+              : 0,
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch organization usage",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get organization users
+app.get(
+  "/super-admin/organizations/:orgId/users",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const { page = 1, limit = 10 } = req.query;
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      const total = await usersCollection.countDocuments({
+        organizationId: new ObjectId(orgId),
+      });
+
+      const users = await usersCollection
+        .find({ organizationId: new ObjectId(orgId) })
+        .project({
+          _id: 1,
+          name: 1,
+          email: 1,
+          role: 1,
+          status: 1,
+          lastLogin: 1,
+          createdAt: 1,
+        })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .toArray();
+
+      res.json({
+        success: true,
+        data: {
+          users,
+          pagination: {
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch organization users",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get organization activity logs
+app.get(
+  "/super-admin/organizations/:orgId/activity",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const { page = 1, limit = 20, action = "" } = req.query;
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      const query = { organizationId: new ObjectId(orgId) };
+      if (action) {
+        query.action = action;
+      }
+
+      const total = await activityLogsCollection.countDocuments(query);
+
+      const activities = await activityLogsCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .toArray();
+
+      res.json({
+        success: true,
+        data: {
+          activities,
+          pagination: {
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch organization activity",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get organization payment history
+app.get(
+  "/super-admin/organizations/:orgId/payments",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const { page = 1, limit = 10 } = req.query;
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      const total = await paymentsCollection.countDocuments({
+        organizationId: new ObjectId(orgId),
+      });
+
+      const payments = await paymentsCollection
+        .find({ organizationId: new ObjectId(orgId) })
+        .sort({ paymentDate: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .toArray();
+
+      res.json({
+        success: true,
+        data: {
+          payments,
+          pagination: {
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch organization payments",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SUPER ADMIN: USERS ====================
+
+// List all platform users
+app.get(
+  "/super-admin/users",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const {
+        page = 1,
+        limit = 20,
+        search = "",
+        org = "",
+        role = "",
+        status = "",
+      } = req.query;
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      const query = {};
+
+      if (search) {
+        query.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { email: { $regex: search, $options: "i" } },
+        ];
+      }
+
+      if (org) {
+        query.organizationId = new ObjectId(org);
+      }
+
+      if (role) {
+        query.role = role;
+      }
+
+      if (status) {
+        query.status = status;
+      }
+
+      const total = await usersCollection.countDocuments(query);
+
+      const users = await usersCollection
+        .aggregate([
+          { $match: query },
+          { $sort: { createdAt: -1 } },
+          { $skip: skip },
+          { $limit: parseInt(limit) },
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "organizationId",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+          {
+            $project: {
+              _id: 1,
+              name: 1,
+              email: 1,
+              phone: 1,
+              photoURL: 1,
+              role: 1,
+              status: 1,
+              isSuperAdmin: 1,
+              lastLogin: 1,
+              createdAt: 1,
+              organization: {
+                _id: "$orgData._id",
+                name: "$orgData.name",
+                slug: "$orgData.slug",
+              },
+            },
+          },
+        ])
+        .toArray();
+
+      res.json({
+        success: true,
+        data: {
+          users,
+          pagination: {
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch users",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get single user details
+app.get(
+  "/super-admin/users/:userId",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+
+      const user = await usersCollection
+        .aggregate([
+          { $match: { _id: new ObjectId(userId) } },
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "organizationId",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+        ])
+        .toArray();
+
+      if (!user || user.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      const userData = user[0];
+      userData.organization = {
+        _id: userData.orgData?._id,
+        name: userData.orgData?.name,
+        slug: userData.orgData?.slug,
+      };
+      delete userData.orgData;
+      delete userData.password;
+
+      // Get user activity count
+      const activityCount = await activityLogsCollection.countDocuments({
+        userId: new ObjectId(userId),
+      });
+
+      userData.activityCount = activityCount;
+
+      res.json({
+        success: true,
+        data: userData,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch user",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Promote user to super admin
+app.patch(
+  "/super-admin/users/:userId/promote-super-admin",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+
+      const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      if (user.isSuperAdmin || user.role === "super_admin") {
+        return res.status(400).json({
+          success: false,
+          message: "User is already a super admin",
+        });
+      }
+
+      await usersCollection.updateOne(
+        { _id: new ObjectId(userId) },
+        {
+          $set: {
+            isSuperAdmin: true,
+            role: "super_admin",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "promoted_to_super_admin",
+        "user",
+        userId,
+        user.organizationId?.toString(),
+        { userName: user.name, email: user.email },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "User promoted to super admin successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to promote user",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Demote user from super admin
+app.patch(
+  "/super-admin/users/:userId/demote-super-admin",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const { newRole = "org_owner" } = req.body;
+
+      // Prevent self-demotion
+      if (req.userId.toString() === userId) {
+        return res.status(400).json({
+          success: false,
+          message: "Cannot demote yourself",
+        });
+      }
+
+      const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      if (!user.isSuperAdmin && user.role !== "super_admin") {
+        return res.status(400).json({
+          success: false,
+          message: "User is not a super admin",
+        });
+      }
+
+      await usersCollection.updateOne(
+        { _id: new ObjectId(userId) },
+        {
+          $set: {
+            isSuperAdmin: false,
+            role: newRole,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "demoted_from_super_admin",
+        "user",
+        userId,
+        user.organizationId?.toString(),
+        { userName: user.name, email: user.email, newRole },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "User demoted from super admin successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to demote user",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Change user status
+app.patch(
+  "/super-admin/users/:userId/status",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const { status } = req.body;
+
+      if (!["active", "inactive", "suspended"].includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid status. Must be: active, inactive, or suspended",
+        });
+      }
+
+      const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      await usersCollection.updateOne(
+        { _id: new ObjectId(userId) },
+        {
+          $set: {
+            status,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "status_changed",
+        "user",
+        userId,
+        user.organizationId?.toString(),
+        { previousStatus: user.status, newStatus: status },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "User status updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update user status",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Generate impersonation token
+app.post(
+  "/super-admin/users/:userId/impersonate",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+
+      const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      // Generate a temporary impersonation token (simplified)
+      // In production, use JWT with short expiry
+      const impersonationToken = Buffer.from(
+        JSON.stringify({
+          userId,
+          impersonatedBy: req.userId.toString(),
+          createdAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), // 1 hour
+        })
+      ).toString("base64");
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "impersonated_user",
+        "user",
+        userId,
+        user.organizationId?.toString(),
+        { userName: user.name, email: user.email },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Impersonation token generated",
+        data: {
+          token: impersonationToken,
+          user: {
+            _id: user._id,
+            name: user.name,
+            email: user.email,
+            role: user.role,
+          },
+          expiresIn: "1 hour",
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to generate impersonation token",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// List all super admin users
+app.get(
+  "/super-admin/users/super-admins/list",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const superAdmins = await usersCollection
+        .find({
+          $or: [{ isSuperAdmin: true }, { role: "super_admin" }],
+        })
+        .project({
+          _id: 1,
+          name: 1,
+          email: 1,
+          phone: 1,
+          photoURL: 1,
+          status: 1,
+          lastLogin: 1,
+          createdAt: 1,
+        })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.json({
+        success: true,
+        data: superAdmins,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch super admins",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SUPER ADMIN: SUBSCRIPTIONS ====================
+
+// List all subscriptions
+app.get(
+  "/super-admin/subscriptions",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const {
+        page = 1,
+        limit = 20,
+        tier = "",
+        status = "",
+        billingCycle = "",
+        search = "",
+      } = req.query;
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      const query = {};
+
+      if (tier) {
+        query.tier = tier;
+      }
+
+      if (status) {
+        query.status = status;
+      }
+
+      if (billingCycle) {
+        query.billingCycle = billingCycle;
+      }
+
+      const total = await subscriptionsCollection.countDocuments(query);
+
+      const subscriptions = await subscriptionsCollection
+        .aggregate([
+          { $match: query },
+          { $sort: { createdAt: -1 } },
+          { $skip: skip },
+          { $limit: parseInt(limit) },
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "organizationId",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+          {
+            $match: search
+              ? {
+                  "orgData.name": { $regex: search, $options: "i" },
+                }
+              : {},
+          },
+          {
+            $project: {
+              _id: 1,
+              tier: 1,
+              status: 1,
+              billingCycle: 1,
+              amount: 1,
+              currency: 1,
+              currentPeriodStart: 1,
+              currentPeriodEnd: 1,
+              nextBillingDate: 1,
+              trialEndDate: 1,
+              createdAt: 1,
+              organization: {
+                _id: "$orgData._id",
+                name: "$orgData.name",
+                slug: "$orgData.slug",
+              },
+            },
+          },
+        ])
+        .toArray();
+
+      res.json({
+        success: true,
+        data: {
+          subscriptions,
+          pagination: {
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch subscriptions",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get single subscription details
+app.get(
+  "/super-admin/subscriptions/:subscriptionId",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { subscriptionId } = req.params;
+
+      const subscription = await subscriptionsCollection
+        .aggregate([
+          { $match: { _id: new ObjectId(subscriptionId) } },
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "organizationId",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "payments",
+              localField: "organizationId",
+              foreignField: "organizationId",
+              as: "payments",
+            },
+          },
+        ])
+        .toArray();
+
+      if (!subscription || subscription.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Subscription not found",
+        });
+      }
+
+      const subData = subscription[0];
+      subData.organization = {
+        _id: subData.orgData?._id,
+        name: subData.orgData?.name,
+        slug: subData.orgData?.slug,
+      };
+      delete subData.orgData;
+
+      // Sort payments by date
+      subData.payments = subData.payments
+        .sort((a, b) => new Date(b.paymentDate || b.createdAt) - new Date(a.paymentDate || a.createdAt))
+        .slice(0, 10);
+
+      res.json({
+        success: true,
+        data: subData,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch subscription",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Manual upgrade subscription
+app.patch(
+  "/super-admin/subscriptions/:subscriptionId/upgrade",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { subscriptionId } = req.params;
+      const { newTier, prorated = false } = req.body;
+
+      const subscription = await subscriptionsCollection.findOne({
+        _id: new ObjectId(subscriptionId),
+      });
+
+      if (!subscription) {
+        return res.status(404).json({
+          success: false,
+          message: "Subscription not found",
+        });
+      }
+
+      // Get the new plan
+      const plan = await subscriptionPlansCollection.findOne({ tier: newTier });
+
+      if (!plan) {
+        return res.status(404).json({
+          success: false,
+          message: "Plan not found",
+        });
+      }
+
+      const previousTier = subscription.tier;
+
+      // Update subscription
+      await subscriptionsCollection.updateOne(
+        { _id: new ObjectId(subscriptionId) },
+        {
+          $set: {
+            tier: newTier,
+            amount: plan.monthlyPrice || plan.amount,
+            status: "active",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Update organization limits
+      await organizationsCollection.updateOne(
+        { _id: subscription.organizationId },
+        {
+          $set: {
+            subscriptionTier: newTier,
+            subscriptionStatus: "active",
+            limits: plan.limits,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "upgraded_subscription",
+        "subscription",
+        subscriptionId,
+        subscription.organizationId.toString(),
+        { previousTier, newTier, prorated },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Subscription upgraded successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to upgrade subscription",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Manual downgrade subscription
+app.patch(
+  "/super-admin/subscriptions/:subscriptionId/downgrade",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { subscriptionId } = req.params;
+      const { newTier, immediate = false } = req.body;
+
+      const subscription = await subscriptionsCollection.findOne({
+        _id: new ObjectId(subscriptionId),
+      });
+
+      if (!subscription) {
+        return res.status(404).json({
+          success: false,
+          message: "Subscription not found",
+        });
+      }
+
+      const plan = await subscriptionPlansCollection.findOne({ tier: newTier });
+
+      if (!plan) {
+        return res.status(404).json({
+          success: false,
+          message: "Plan not found",
+        });
+      }
+
+      const previousTier = subscription.tier;
+
+      if (immediate) {
+        // Immediate downgrade
+        await subscriptionsCollection.updateOne(
+          { _id: new ObjectId(subscriptionId) },
+          {
+            $set: {
+              tier: newTier,
+              amount: plan.monthlyPrice || plan.amount,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        await organizationsCollection.updateOne(
+          { _id: subscription.organizationId },
+          {
+            $set: {
+              subscriptionTier: newTier,
+              limits: plan.limits,
+              updatedAt: new Date(),
+            },
+          }
+        );
+      } else {
+        // Downgrade at period end
+        await subscriptionsCollection.updateOne(
+          { _id: new ObjectId(subscriptionId) },
+          {
+            $set: {
+              pendingDowngrade: {
+                newTier,
+                effectiveDate: subscription.currentPeriodEnd,
+              },
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "downgraded_subscription",
+        "subscription",
+        subscriptionId,
+        subscription.organizationId.toString(),
+        { previousTier, newTier, immediate },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: immediate
+          ? "Subscription downgraded immediately"
+          : "Subscription will be downgraded at the end of the current period",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to downgrade subscription",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Cancel subscription
+app.patch(
+  "/super-admin/subscriptions/:subscriptionId/cancel",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { subscriptionId } = req.params;
+      const { immediate = false, reason = "" } = req.body;
+
+      const subscription = await subscriptionsCollection.findOne({
+        _id: new ObjectId(subscriptionId),
+      });
+
+      if (!subscription) {
+        return res.status(404).json({
+          success: false,
+          message: "Subscription not found",
+        });
+      }
+
+      if (immediate) {
+        await subscriptionsCollection.updateOne(
+          { _id: new ObjectId(subscriptionId) },
+          {
+            $set: {
+              status: "cancelled",
+              cancelledAt: new Date(),
+              cancellationReason: reason,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        await organizationsCollection.updateOne(
+          { _id: subscription.organizationId },
+          {
+            $set: {
+              subscriptionStatus: "cancelled",
+              updatedAt: new Date(),
+            },
+          }
+        );
+      } else {
+        await subscriptionsCollection.updateOne(
+          { _id: new ObjectId(subscriptionId) },
+          {
+            $set: {
+              cancelAtPeriodEnd: true,
+              cancellationReason: reason,
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "cancelled_subscription",
+        "subscription",
+        subscriptionId,
+        subscription.organizationId.toString(),
+        { immediate, reason },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: immediate
+          ? "Subscription cancelled immediately"
+          : "Subscription will be cancelled at the end of the current period",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to cancel subscription",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Extend trial
+app.patch(
+  "/super-admin/subscriptions/:subscriptionId/extend-trial",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { subscriptionId } = req.params;
+      const { additionalDays = 14 } = req.body;
+
+      const subscription = await subscriptionsCollection.findOne({
+        _id: new ObjectId(subscriptionId),
+      });
+
+      if (!subscription) {
+        return res.status(404).json({
+          success: false,
+          message: "Subscription not found",
+        });
+      }
+
+      const currentTrialEnd = subscription.trialEndDate || new Date();
+      const newTrialEnd = new Date(currentTrialEnd);
+      newTrialEnd.setDate(newTrialEnd.getDate() + parseInt(additionalDays));
+
+      await subscriptionsCollection.updateOne(
+        { _id: new ObjectId(subscriptionId) },
+        {
+          $set: {
+            trialEndDate: newTrialEnd,
+            currentPeriodEnd: newTrialEnd,
+            nextBillingDate: newTrialEnd,
+            status: "trial",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      await organizationsCollection.updateOne(
+        { _id: subscription.organizationId },
+        {
+          $set: {
+            subscriptionStatus: "trial",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "extended_trial",
+        "subscription",
+        subscriptionId,
+        subscription.organizationId.toString(),
+        {
+          additionalDays,
+          previousTrialEnd: currentTrialEnd,
+          newTrialEnd,
+        },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: `Trial extended by ${additionalDays} days`,
+        data: { newTrialEnd },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to extend trial",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Record manual payment
+app.post(
+  "/super-admin/subscriptions/:subscriptionId/manual-payment",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { subscriptionId } = req.params;
+      const { amount, paymentMethod, paymentDate, notes } = req.body;
+
+      if (!amount || amount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Valid amount is required",
+        });
+      }
+
+      const subscription = await subscriptionsCollection.findOne({
+        _id: new ObjectId(subscriptionId),
+      });
+
+      if (!subscription) {
+        return res.status(404).json({
+          success: false,
+          message: "Subscription not found",
+        });
+      }
+
+      // Create payment record
+      const payment = {
+        organizationId: subscription.organizationId,
+        subscriptionId: new ObjectId(subscriptionId),
+        amount: parseFloat(amount),
+        currency: subscription.currency || "BDT",
+        status: "completed",
+        paymentMethod: paymentMethod || "manual",
+        paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
+        notes,
+        recordedBy: req.userId,
+        isManualPayment: true,
+        createdAt: new Date(),
+      };
+
+      const result = await paymentsCollection.insertOne(payment);
+
+      // Update subscription status to active if it was cancelled/expired
+      if (["cancelled", "expired", "trial"].includes(subscription.status)) {
+        const nextBillingDate = new Date();
+        nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+
+        await subscriptionsCollection.updateOne(
+          { _id: new ObjectId(subscriptionId) },
+          {
+            $set: {
+              status: "active",
+              currentPeriodStart: new Date(),
+              currentPeriodEnd: nextBillingDate,
+              nextBillingDate,
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        await organizationsCollection.updateOne(
+          { _id: subscription.organizationId },
+          {
+            $set: {
+              subscriptionStatus: "active",
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "recorded_manual_payment",
+        "payment",
+        result.insertedId.toString(),
+        subscription.organizationId.toString(),
+        { amount, paymentMethod, notes },
+        req
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Payment recorded successfully",
+        data: { paymentId: result.insertedId },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to record payment",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// List all payments
+app.get(
+  "/super-admin/subscriptions/payments/list",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const {
+        page = 1,
+        limit = 20,
+        status = "",
+        org = "",
+        dateFrom = "",
+        dateTo = "",
+      } = req.query;
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      const query = {};
+
+      if (status) {
+        query.status = status;
+      }
+
+      if (org) {
+        query.organizationId = new ObjectId(org);
+      }
+
+      if (dateFrom || dateTo) {
+        query.paymentDate = {};
+        if (dateFrom) {
+          query.paymentDate.$gte = new Date(dateFrom);
+        }
+        if (dateTo) {
+          query.paymentDate.$lte = new Date(dateTo);
+        }
+      }
+
+      const total = await paymentsCollection.countDocuments(query);
+
+      const payments = await paymentsCollection
+        .aggregate([
+          { $match: query },
+          { $sort: { paymentDate: -1, createdAt: -1 } },
+          { $skip: skip },
+          { $limit: parseInt(limit) },
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "organizationId",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+          {
+            $project: {
+              _id: 1,
+              amount: 1,
+              currency: 1,
+              status: 1,
+              paymentMethod: 1,
+              paymentDate: 1,
+              invoiceNumber: 1,
+              isManualPayment: 1,
+              createdAt: 1,
+              organization: {
+                _id: "$orgData._id",
+                name: "$orgData.name",
+              },
+            },
+          },
+        ])
+        .toArray();
+
+      res.json({
+        success: true,
+        data: {
+          payments,
+          pagination: {
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch payments",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SUPER ADMIN: PLANS ====================
+
+// List all subscription plans
+app.get(
+  "/super-admin/plans",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const plans = await subscriptionPlansCollection
+        .find({})
+        .sort({ displayOrder: 1, createdAt: 1 })
+        .toArray();
+
+      res.json({
+        success: true,
+        data: plans,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch plans",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Create subscription plan
+app.post(
+  "/super-admin/plans",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const {
+        tier,
+        name,
+        description,
+        monthlyPrice,
+        yearlyPrice,
+        currency = "BDT",
+        limits,
+        features,
+        isPopular = false,
+        isActive = true,
+        displayOrder = 0,
+      } = req.body;
+
+      // Validation
+      if (!tier || !name) {
+        return res.status(400).json({
+          success: false,
+          message: "Tier and name are required",
+        });
+      }
+
+      // Check if tier already exists
+      const existing = await subscriptionPlansCollection.findOne({ tier });
+
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          message: "Plan with this tier already exists",
+        });
+      }
+
+      // If isPopular is true, unset it from other plans
+      if (isPopular) {
+        await subscriptionPlansCollection.updateMany(
+          { isPopular: true },
+          { $set: { isPopular: false } }
+        );
+      }
+
+      const plan = {
+        tier,
+        name,
+        description: description || "",
+        monthlyPrice: monthlyPrice || 0,
+        yearlyPrice: yearlyPrice || 0,
+        currency,
+        limits: limits || {
+          maxStudents: 50,
+          maxBatches: 3,
+          maxStaff: 2,
+          maxStorage: 100,
+        },
+        features: features || [],
+        isPopular,
+        isActive,
+        displayOrder,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await subscriptionPlansCollection.insertOne(plan);
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "created",
+        "subscription_plan",
+        result.insertedId.toString(),
+        null,
+        { tier, name, monthlyPrice },
+        req
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Plan created successfully",
+        data: { planId: result.insertedId },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to create plan",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Update subscription plan
+app.patch(
+  "/super-admin/plans/:planId",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { planId } = req.params;
+      const updates = req.body;
+
+      const currentPlan = await subscriptionPlansCollection.findOne({
+        _id: new ObjectId(planId),
+      });
+
+      if (!currentPlan) {
+        return res.status(404).json({
+          success: false,
+          message: "Plan not found",
+        });
+      }
+
+      // Remove fields that shouldn't be updated
+      delete updates._id;
+      delete updates.createdAt;
+
+      // If isPopular is being set to true, unset it from other plans
+      if (updates.isPopular === true) {
+        await subscriptionPlansCollection.updateMany(
+          { _id: { $ne: new ObjectId(planId) }, isPopular: true },
+          { $set: { isPopular: false } }
+        );
+      }
+
+      updates.updatedAt = new Date();
+
+      await subscriptionPlansCollection.updateOne(
+        { _id: new ObjectId(planId) },
+        { $set: updates }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "updated",
+        "subscription_plan",
+        planId,
+        null,
+        { before: currentPlan, after: updates },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Plan updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update plan",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Delete subscription plan (soft delete)
+app.delete(
+  "/super-admin/plans/:planId",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { planId } = req.params;
+
+      const plan = await subscriptionPlansCollection.findOne({
+        _id: new ObjectId(planId),
+      });
+
+      if (!plan) {
+        return res.status(404).json({
+          success: false,
+          message: "Plan not found",
+        });
+      }
+
+      // Soft delete by marking as inactive
+      await subscriptionPlansCollection.updateOne(
+        { _id: new ObjectId(planId) },
+        {
+          $set: {
+            isActive: false,
+            deletedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "deleted",
+        "subscription_plan",
+        planId,
+        null,
+        { tier: plan.tier, name: plan.name },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Plan deleted successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete plan",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Toggle plan popularity
+app.patch(
+  "/super-admin/plans/:planId/toggle-popular",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { planId } = req.params;
+
+      const plan = await subscriptionPlansCollection.findOne({
+        _id: new ObjectId(planId),
+      });
+
+      if (!plan) {
+        return res.status(404).json({
+          success: false,
+          message: "Plan not found",
+        });
+      }
+
+      const newIsPopular = !plan.isPopular;
+
+      // If setting to popular, unset from other plans
+      if (newIsPopular) {
+        await subscriptionPlansCollection.updateMany(
+          { _id: { $ne: new ObjectId(planId) }, isPopular: true },
+          { $set: { isPopular: false } }
+        );
+      }
+
+      await subscriptionPlansCollection.updateOne(
+        { _id: new ObjectId(planId) },
+        {
+          $set: {
+            isPopular: newIsPopular,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      res.json({
+        success: true,
+        message: `Plan ${newIsPopular ? "marked as" : "unmarked from"} most popular`,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to toggle plan popularity",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SUPER ADMIN: ACTIVITY LOGS ====================
+
+// List platform-wide activity logs
+app.get(
+  "/super-admin/activity-logs",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const {
+        page = 1,
+        limit = 50,
+        org = "",
+        user = "",
+        action = "",
+        resource = "",
+        dateFrom = "",
+        dateTo = "",
+        search = "",
+      } = req.query;
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      const query = {};
+
+      if (org) {
+        query.organizationId = new ObjectId(org);
+      }
+
+      if (user) {
+        query.userId = new ObjectId(user);
+      }
+
+      if (action) {
+        query.action = { $regex: action, $options: "i" };
+      }
+
+      if (resource) {
+        query.resource = resource;
+      }
+
+      if (search) {
+        query.resourceId = { $regex: search, $options: "i" };
+      }
+
+      if (dateFrom || dateTo) {
+        query.createdAt = {};
+        if (dateFrom) {
+          query.createdAt.$gte = new Date(dateFrom);
+        }
+        if (dateTo) {
+          query.createdAt.$lte = new Date(dateTo);
+        }
+      }
+
+      const total = await activityLogsCollection.countDocuments(query);
+
+      const logs = await activityLogsCollection
+        .aggregate([
+          { $match: query },
+          { $sort: { createdAt: -1 } },
+          { $skip: skip },
+          { $limit: parseInt(limit) },
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "organizationId",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "users",
+              localField: "userId",
+              foreignField: "_id",
+              as: "userData",
+            },
+          },
+          { $unwind: { path: "$userData", preserveNullAndEmptyArrays: true } },
+          {
+            $project: {
+              _id: 1,
+              action: 1,
+              resource: 1,
+              resourceId: 1,
+              changes: 1,
+              ipAddress: 1,
+              userAgent: 1,
+              isSuperAdminAction: 1,
+              createdAt: 1,
+              user: {
+                _id: "$userData._id",
+                name: "$userData.name",
+                email: "$userData.email",
+              },
+              organization: {
+                _id: "$orgData._id",
+                name: "$orgData.name",
+              },
+            },
+          },
+        ])
+        .toArray();
+
+      res.json({
+        success: true,
+        data: {
+          logs,
+          pagination: {
+            total,
+            page: parseInt(page),
+            limit: parseInt(limit),
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch activity logs",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Get detailed activity log
+app.get(
+  "/super-admin/activity-logs/:logId",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { logId } = req.params;
+
+      const log = await activityLogsCollection
+        .aggregate([
+          { $match: { _id: new ObjectId(logId) } },
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "organizationId",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "users",
+              localField: "userId",
+              foreignField: "_id",
+              as: "userData",
+            },
+          },
+          { $unwind: { path: "$userData", preserveNullAndEmptyArrays: true } },
+        ])
+        .toArray();
+
+      if (!log || log.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Activity log not found",
+        });
+      }
+
+      const logData = log[0];
+      logData.user = {
+        _id: logData.userData?._id,
+        name: logData.userData?.name,
+        email: logData.userData?.email,
+      };
+      logData.organization = {
+        _id: logData.orgData?._id,
+        name: logData.orgData?.name,
+      };
+      delete logData.userData;
+      delete logData.orgData;
+
+      res.json({
+        success: true,
+        data: logData,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch activity log",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Export activity logs as CSV
+app.get(
+  "/super-admin/activity-logs/export/csv",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const {
+        org = "",
+        user = "",
+        action = "",
+        resource = "",
+        dateFrom = "",
+        dateTo = "",
+      } = req.query;
+
+      const query = {};
+
+      if (org) {
+        query.organizationId = new ObjectId(org);
+      }
+
+      if (user) {
+        query.userId = new ObjectId(user);
+      }
+
+      if (action) {
+        query.action = { $regex: action, $options: "i" };
+      }
+
+      if (resource) {
+        query.resource = resource;
+      }
+
+      if (dateFrom || dateTo) {
+        query.createdAt = {};
+        if (dateFrom) {
+          query.createdAt.$gte = new Date(dateFrom);
+        }
+        if (dateTo) {
+          query.createdAt.$lte = new Date(dateTo);
+        }
+      }
+
+      const logs = await activityLogsCollection
+        .aggregate([
+          { $match: query },
+          { $sort: { createdAt: -1 } },
+          { $limit: 10000 }, // Limit export to 10k rows
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "organizationId",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+        ])
+        .toArray();
+
+      // Create CSV
+      const csvHeader = "Date,User,Organization,Action,Resource,Resource ID\n";
+      const csvRows = logs
+        .map((log) => {
+          return `"${new Date(log.createdAt).toISOString()}","${log.userName || ""}","${log.orgData?.name || ""}","${log.action}","${log.resource}","${log.resourceId || ""}"`;
+        })
+        .join("\n");
+
+      const csv = csvHeader + csvRows;
+
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename=activity_logs_${new Date().toISOString().split("T")[0]}.csv`
+      );
+      res.send(csv);
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to export activity logs",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SUPER ADMIN: ANALYTICS ====================
+
+// Revenue analytics
+app.get(
+  "/super-admin/analytics/revenue",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { period = "12months" } = req.query;
+
+      let months = 12;
+      switch (period) {
+        case "6months":
+          months = 6;
+          break;
+        case "30days":
+          months = 1;
+          break;
+        default:
+          months = 12;
+      }
+
+      const startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - months);
+
+      // MRR (current monthly active subscriptions)
+      const mrrResult = await subscriptionsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "active",
+              billingCycle: "monthly",
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              mrr: { $sum: "$amount" },
+            },
+          },
+        ])
+        .toArray();
+
+      const mrr = mrrResult[0]?.mrr || 0;
+      const arr = mrr * 12;
+
+      // Total revenue
+      const totalRevenueResult = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "completed",
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              totalRevenue: { $sum: "$amount" },
+            },
+          },
+        ])
+        .toArray();
+
+      const totalRevenue = totalRevenueResult[0]?.totalRevenue || 0;
+
+      // Revenue trend
+      const trend = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "completed",
+              paymentDate: { $gte: startDate },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: { format: "%Y-%m", date: "$paymentDate" },
+              },
+              revenue: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+        ])
+        .toArray();
+
+      // Calculate growth
+      let growth = 0;
+      if (trend.length >= 2) {
+        const currentMonth = trend[trend.length - 1]?.revenue || 0;
+        const prevMonth = trend[trend.length - 2]?.revenue || 0;
+        growth = prevMonth > 0 ? ((currentMonth - prevMonth) / prevMonth) * 100 : 0;
+      }
+
+      res.json({
+        success: true,
+        data: {
+          summary: {
+            mrr,
+            arr,
+            totalRevenue,
+            growth: parseFloat(growth.toFixed(2)),
+          },
+          trend: trend.map((t) => ({
+            period: t._id,
+            revenue: t.revenue,
+            mrr, // Simplified: current MRR for all months
+          })),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch revenue analytics",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Growth analytics
+app.get(
+  "/super-admin/analytics/growth",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { period = "12months" } = req.query;
+
+      let months = 12;
+      switch (period) {
+        case "6months":
+          months = 6;
+          break;
+        default:
+          months = 12;
+      }
+
+      const startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - months);
+
+      // Organization growth
+      const orgGrowth = await organizationsCollection
+        .aggregate([
+          {
+            $match: {
+              createdAt: { $gte: startDate },
+              status: { $ne: "deleted" },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: { format: "%Y-%m", date: "$createdAt" },
+              },
+              new: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+        ])
+        .toArray();
+
+      // User growth
+      const userGrowth = await usersCollection
+        .aggregate([
+          {
+            $match: {
+              createdAt: { $gte: startDate },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: { format: "%Y-%m", date: "$createdAt" },
+              },
+              new: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+        ])
+        .toArray();
+
+      // Calculate cumulative totals
+      let orgTotal = await organizationsCollection.countDocuments({
+        createdAt: { $lt: startDate },
+        status: { $ne: "deleted" },
+      });
+      let userTotal = await usersCollection.countDocuments({
+        createdAt: { $lt: startDate },
+      });
+
+      const organizations = orgGrowth.map((o) => {
+        orgTotal += o.new;
+        return {
+          period: o._id,
+          new: o.new,
+          total: orgTotal,
+        };
+      });
+
+      const users = userGrowth.map((u) => {
+        userTotal += u.new;
+        return {
+          period: u._id,
+          new: u.new,
+          total: userTotal,
+        };
+      });
+
+      res.json({
+        success: true,
+        data: {
+          organizations,
+          users,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch growth analytics",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Churn analytics
+app.get(
+  "/super-admin/analytics/churn",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { period = "12months" } = req.query;
+
+      let months = 12;
+      switch (period) {
+        case "6months":
+          months = 6;
+          break;
+        default:
+          months = 12;
+      }
+
+      const startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - months);
+
+      // Get cancelled subscriptions by month
+      const cancelled = await subscriptionsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "cancelled",
+              cancelledAt: { $gte: startDate },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: { format: "%Y-%m", date: "$cancelledAt" },
+              },
+              cancelled: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+        ])
+        .toArray();
+
+      // Get total active subscriptions at each month end (simplified)
+      const totalActive = await subscriptionsCollection.countDocuments({
+        status: "active",
+      });
+
+      const churnData = cancelled.map((c) => ({
+        period: c._id,
+        cancelled: c.cancelled,
+        total: totalActive + c.cancelled, // Simplified approximation
+        rate: parseFloat((((c.cancelled) / (totalActive + c.cancelled)) * 100).toFixed(2)),
+      }));
+
+      res.json({
+        success: true,
+        data: churnData,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch churn analytics",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Top organizations by revenue
+app.get(
+  "/super-admin/analytics/top-organizations",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { limit = 10, period = "12months" } = req.query;
+
+      let months = 12;
+      switch (period) {
+        case "6months":
+          months = 6;
+          break;
+        default:
+          months = 12;
+      }
+
+      const startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - months);
+
+      const topOrgs = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "completed",
+              paymentDate: { $gte: startDate },
+            },
+          },
+          {
+            $group: {
+              _id: "$organizationId",
+              totalRevenue: { $sum: "$amount" },
+              paymentCount: { $sum: 1 },
+            },
+          },
+          {
+            $lookup: {
+              from: "organizations",
+              localField: "_id",
+              foreignField: "_id",
+              as: "orgData",
+            },
+          },
+          { $unwind: { path: "$orgData", preserveNullAndEmptyArrays: true } },
+          {
+            $lookup: {
+              from: "subscriptions",
+              localField: "_id",
+              foreignField: "organizationId",
+              as: "subData",
+            },
+          },
+          { $unwind: { path: "$subData", preserveNullAndEmptyArrays: true } },
+          { $sort: { totalRevenue: -1 } },
+          { $limit: parseInt(limit) },
+          {
+            $project: {
+              organization: {
+                _id: "$orgData._id",
+                name: "$orgData.name",
+                slug: "$orgData.slug",
+              },
+              tier: "$subData.tier",
+              totalRevenue: 1,
+              paymentCount: 1,
+            },
+          },
+        ])
+        .toArray();
+
+      res.json({
+        success: true,
+        data: topOrgs,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch top organizations",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Feature usage statistics
+app.get(
+  "/super-admin/analytics/feature-usage",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      // Total organizations
+      const totalOrgs = await organizationsCollection.countDocuments({
+        status: { $ne: "deleted" },
+      });
+
+      // Students
+      const totalStudents = await studentsCollection.countDocuments({
+        status: "active",
+      });
+
+      // Batches
+      const totalBatches = await batchesCollection.countDocuments({
+        status: "active",
+      });
+
+      // Attendance records
+      const totalAttendance = await attendencesCollection.countDocuments({});
+
+      // Exams
+      const totalExams = await examsCollection.countDocuments({});
+
+      // Fee collection
+      const feeStats = await feesCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalCollected: { $sum: "$paidAmount" },
+              totalRecords: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray();
+
+      const avgPerOrg = (val) => (totalOrgs > 0 ? Math.round(val / totalOrgs) : 0);
+
+      res.json({
+        success: true,
+        data: {
+          students: {
+            total: totalStudents,
+            avgPerOrg: avgPerOrg(totalStudents),
+          },
+          batches: {
+            total: totalBatches,
+            avgPerOrg: avgPerOrg(totalBatches),
+          },
+          attendance: {
+            total: totalAttendance,
+            avgPerOrg: avgPerOrg(totalAttendance),
+          },
+          exams: {
+            total: totalExams,
+            avgPerOrg: avgPerOrg(totalExams),
+          },
+          fees: {
+            totalCollected: feeStats[0]?.totalCollected || 0,
+            avgPerOrg: avgPerOrg(feeStats[0]?.totalCollected || 0),
+          },
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch feature usage",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==================== SUPER ADMIN: PLATFORM SETTINGS ====================
+
+// Get platform settings
+app.get(
+  "/super-admin/settings",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { category = "" } = req.query;
+
+      const query = {};
+      if (category) {
+        query.category = category;
+      }
+
+      const settings = await platformSettingsCollection.find(query).toArray();
+
+      // Group by category
+      const grouped = {
+        general: {},
+        trial: {},
+        email: {},
+        security: {},
+      };
+
+      settings.forEach((setting) => {
+        if (grouped[setting.category]) {
+          grouped[setting.category][setting.key] = setting.value;
+        }
+      });
+
+      // Set defaults if no settings exist
+      if (Object.keys(grouped.general).length === 0) {
+        grouped.general = {
+          platformName: "Coaching Management System",
+          supportEmail: "support@example.com",
+          defaultCurrency: "BDT",
+          timezone: "Asia/Dhaka",
+        };
+      }
+
+      if (Object.keys(grouped.trial).length === 0) {
+        grouped.trial = {
+          defaultTrialPeriodDays: 14,
+          allowMultipleTrials: false,
+          trialPlan: "professional",
+        };
+      }
+
+      if (Object.keys(grouped.email).length === 0) {
+        grouped.email = {
+          smtpHost: "",
+          smtpPort: 587,
+          fromName: "Coaching System",
+          fromEmail: "",
+        };
+      }
+
+      if (Object.keys(grouped.security).length === 0) {
+        grouped.security = {
+          sessionTimeoutMinutes: 30,
+          maxLoginAttempts: 5,
+          passwordMinLength: 8,
+          require2FAForSuperAdmins: false,
+        };
+      }
+
+      res.json({
+        success: true,
+        data: grouped,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch settings",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Update platform settings
+app.patch(
+  "/super-admin/settings",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { category, settings } = req.body;
+
+      if (!category || !settings) {
+        return res.status(400).json({
+          success: false,
+          message: "Category and settings are required",
+        });
+      }
+
+      const validCategories = ["general", "trial", "email", "security"];
+      if (!validCategories.includes(category)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid category",
+        });
+      }
+
+      const previousSettings = {};
+      const operations = [];
+
+      for (const [key, value] of Object.entries(settings)) {
+        // Get previous value for logging
+        const existing = await platformSettingsCollection.findOne({
+          category,
+          key,
+        });
+        previousSettings[key] = existing?.value;
+
+        operations.push({
+          updateOne: {
+            filter: { category, key },
+            update: {
+              $set: {
+                value,
+                updatedBy: req.userId,
+                updatedAt: new Date(),
+              },
+              $setOnInsert: {
+                category,
+                key,
+                createdAt: new Date(),
+              },
+            },
+            upsert: true,
+          },
+        });
+      }
+
+      if (operations.length > 0) {
+        await platformSettingsCollection.bulkWrite(operations);
+      }
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "updated_settings",
+        "platform_settings",
+        category,
+        null,
+        { category, previousSettings, newSettings: settings },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: "Settings updated successfully",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to update settings",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Test email configuration
+app.post(
+  "/super-admin/settings/test-email",
+  ensureDBConnection,
+  authenticateUser,
+  requireSuperAdmin,
+  async (req, res) => {
+    try {
+      const { recipientEmail } = req.body;
+
+      if (!recipientEmail) {
+        return res.status(400).json({
+          success: false,
+          message: "Recipient email is required",
+        });
+      }
+
+      // In a real implementation, this would send a test email
+      // using the configured SMTP settings
+
+      // For now, we'll just simulate success
+      // TODO: Implement actual email sending with nodemailer
+
+      // Log activity
+      await logSuperAdminActivity(
+        req.userId,
+        "tested_email_config",
+        "platform_settings",
+        "email",
+        null,
+        { recipientEmail },
+        req
+      );
+
+      res.json({
+        success: true,
+        message: `Test email would be sent to ${recipientEmail}`,
+        note: "Email sending not yet implemented",
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to test email configuration",
         error: error.message,
       });
     }
