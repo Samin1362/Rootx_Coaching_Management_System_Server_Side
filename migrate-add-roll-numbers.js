@@ -1,3 +1,6 @@
+// CLI Migration Script - Console output intentional for manual execution
+// This script adds roll numbers to existing student records
+
 import { MongoClient } from "mongodb";
 import dotenv from "dotenv";
 

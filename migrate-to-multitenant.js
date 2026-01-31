@@ -1,3 +1,6 @@
+// CLI Migration Script - Console output intentional for manual execution
+// This script is designed to be run from the command line, not as part of the application runtime
+
 import { MongoClient, ObjectId } from "mongodb";
 import dotenv from "dotenv";
 
