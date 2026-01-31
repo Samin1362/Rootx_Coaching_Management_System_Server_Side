@@ -1,3 +1,6 @@
+// CLI Seed Script - Console output intentional for manual execution
+// This script is designed to be run from the command line to seed database with subscription plans
+
 import { MongoClient } from "mongodb";
 import dotenv from "dotenv";
 

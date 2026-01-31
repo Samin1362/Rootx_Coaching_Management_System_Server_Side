@@ -1,3 +1,6 @@
+// CLI Migration Script - Console output intentional for manual execution
+// This script migrates image field to photoURL field in the database
+
 const { MongoClient } = require("mongodb");
 require("dotenv").config();
 
